@@ -4,19 +4,15 @@ In production: enqueues a Cloud Run Job execution that runs the
 ``backend.pipeline_worker`` entrypoint with project_id/user_id/resume/free
 passed as env-var overrides.
 
-In local dev (no ``GCS_BUCKET``): launches the worker as a child process
-so the same code path runs end-to-end. Removes the in-process
-``BackgroundTask`` divergence between dev and prod.
+In local dev (no ``GCS_BUCKET``): runs the pipeline as an in-process
+asyncio task so it can be debugged with a normal debugger.
 """
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
-import subprocess
-import sys
-import threading
-from pathlib import Path
 from typing import Literal
 
 from backend.config import settings
@@ -30,18 +26,17 @@ ExecutionState = Literal[
 
 
 # ---------------------------------------------------------------------------
-# Local subprocess fallback (dev mode)
+# Local async-task path (dev mode)
 # ---------------------------------------------------------------------------
 
 
-# Track child processes so the API can query "is it still running?" in
+# Track in-process tasks so the API can query "is it still running?" in
 # dev. In prod the Cloud Run Jobs admin API answers the same question.
-_local_procs: dict[str, subprocess.Popen] = {}
-_local_procs_lock = threading.Lock()
+_local_tasks: dict[str, asyncio.Task[None]] = {}
 
 
 def _local_execution_name(project_id: str) -> str:
-    """Stable synthetic execution name for the dev subprocess path.
+    """Stable synthetic execution name for the dev in-process path.
 
     Lets the rest of the codebase treat dev runs uniformly with prod
     runs (we always have an ``execution_name`` to store on ProjectMeta
@@ -50,7 +45,64 @@ def _local_execution_name(project_id: str) -> str:
     return f"local/projects/{project_id}"
 
 
-def _spawn_local_subprocess(
+async def _task_wrapper(
+    project_id: str,
+    user_id: str,
+    *,
+    resume: bool,
+    free: bool,
+    mode: str,
+    regen_stages: list[str] | None,
+) -> None:
+    """Run the pipeline in-process with the GCS-backed event broker.
+
+    The SSE handler tails events from storage via ``tail_events``.
+    We temporarily swap the module-level broker so events written by
+    the pipeline end up in storage rather than the in-memory queues.
+    """
+    from backend.services import event_bridge as event_bridge
+    from backend.services import pipeline as pipeline_svc
+    from backend.services.storage import LocalStorageBackend
+
+    storage = LocalStorageBackend(settings.data_dir)
+    original_broker = pipeline_svc.broker
+    pipeline_svc.set_broker(event_bridge.GCSEventBroker(storage, user_id))
+
+    try:
+        # Fresh runs wipe the prior event log so the SSE consumer doesn't
+        # mix old events into the new run. Resume keeps the prior log so
+        # users see the full history.
+        if not resume:
+            pipeline_svc.broker.clear_history(project_id)
+
+        if mode == "run":
+            await pipeline_svc.run_pipeline(
+                storage, user_id, project_id, resume=resume, free=free,
+            )
+        elif mode == "regen":
+            if not regen_stages:
+                raise ValueError("regen mode requires at least one stage")
+            await pipeline_svc.run_regen_pipeline(
+                storage, user_id, project_id, regen_stages,
+            )
+        else:
+            raise ValueError(f"unknown mode {mode!r}; expected 'run' or 'regen'")
+    except asyncio.CancelledError:
+        # Task was cancelled (e.g. via cancel_execution). Publish a
+        # terminal event so the SSE tailer doesn't hang forever.
+        try:
+            pipeline_svc.broker.publish(
+                project_id, "pipeline_cancelled",
+                {"error": "pipeline cancelled by user"},
+            )
+        except Exception:
+            logger.exception("failed to publish cancel event for %s", project_id)
+        raise
+    finally:
+        pipeline_svc.set_broker(original_broker)
+
+
+def _enqueue_local_task(
     project_id: str,
     user_id: str,
     *,
@@ -60,63 +112,46 @@ def _spawn_local_subprocess(
     regen_stages: list[str] | None = None,
 ) -> str:
     name = _local_execution_name(project_id)
-    env = os.environ.copy()
-    env["PROJECT_ID"] = project_id
-    env["USER_ID"] = user_id
-    env["RESUME"] = "1" if resume else "0"
-    env["FREE"] = "1" if free else "0"
-    env["MODE"] = mode
-    if regen_stages:
-        env["REGEN_STAGES"] = ",".join(regen_stages)
-    env["EXECUTION_NAME"] = name
-    pythonpath = str(Path(__file__).parent.parent.parent)
-    # env["PYTHONPATH"] = pythonpath
-    # Run the backend worker
-    cmd = [sys.executable, "-m", "backend.pipeline_worker"]
-    proc = subprocess.Popen(
-        cmd,
-        env=env,
-        # Inherit stdout/stderr so logs appear in the dev terminal
-        stdin=subprocess.DEVNULL,
+
+    # Cancel any prior task for the same project before starting a new one.
+    prior = _local_tasks.pop(project_id, None)
+    if prior is not None and not prior.done():
+        prior.cancel()
+
+    task: asyncio.Task[None] = asyncio.create_task(
+        _task_wrapper(
+            project_id, user_id,
+            resume=resume, free=free,
+            mode=mode, regen_stages=regen_stages,
+        )
     )
-    with _local_procs_lock:
-        # Reap any old proc for the same project before tracking the new one.
-        prior = _local_procs.pop(project_id, None)
-        if prior is not None:
-            try:
-                prior.terminate()
-            except Exception:
-                pass
-        _local_procs[project_id] = proc
-    logger.info("dev: spawned worker subprocess pid=%s for %s", proc.pid, project_id)
+    _local_tasks[project_id] = task
+    logger.info("dev: spawned in-process pipeline task for %s", project_id)
     return name
 
 
 def _local_state(project_id: str) -> ExecutionState:
-    with _local_procs_lock:
-        proc = _local_procs.get(project_id)
-    if proc is None:
+    task = _local_tasks.get(project_id)
+    if task is None:
         return "unknown"
-    rc = proc.poll()
-    if rc is None:
+    if not task.done():
         return "running"
-    if rc == 0:
-        return "succeeded"
-    if rc < 0:
-        # Negative return = terminated by signal
+    if task.cancelled():
         return "cancelled"
-    return "failed"
+    exc = task.exception()
+    if exc is not None:
+        return "failed"
+    return "succeeded"
 
 
 def _local_cancel(project_id: str) -> None:
-    with _local_procs_lock:
-        proc = _local_procs.get(project_id)
-    if proc is None or proc.poll() is not None:
+    task = _local_tasks.get(project_id)
+    if task is None or task.done():
         return
     try:
-        proc.terminate()
+        task.cancel()
     except Exception:
-        logger.exception("dev: failed to terminate worker subprocess for %s", project_id)
+        logger.exception("dev: failed to cancel pipeline task for %s", project_id)
 
 
 # ---------------------------------------------------------------------------
@@ -280,7 +315,7 @@ def enqueue_pipeline(
     """
     if use_cloud_run_jobs():
         return _enqueue_cloud_run_job(project_id, user_id, resume=resume, free=free)
-    return _spawn_local_subprocess(project_id, user_id, resume=resume, free=free)
+    return _enqueue_local_task(project_id, user_id, resume=resume, free=free)
 
 
 def enqueue_pipeline_regen(
@@ -297,7 +332,7 @@ def enqueue_pipeline_regen(
             project_id, user_id, resume=False, free=True,
             mode="regen", regen_stages=stages,
         )
-    return _spawn_local_subprocess(
+    return _enqueue_local_task(
         project_id, user_id, resume=False, free=True,
         mode="regen", regen_stages=stages,
     )
