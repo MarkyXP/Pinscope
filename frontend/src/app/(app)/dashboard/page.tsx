@@ -17,7 +17,7 @@ import {
 import type { CreditSnapshot, Project } from "@/lib/types";
 import { cn } from "@/lib/utils";
 import { useCredits } from "@/components/billing/credits-context";
-import { OnboardingSurvey } from "@/components/dashboard/onboarding-survey";
+// import { OnboardingSurvey } from "@/components/dashboard/onboarding-survey";
 
 type ViewMode = "cards" | "table";
 const VIEW_STORAGE_KEY = "pinscopex:dashboard:view";
@@ -181,7 +181,7 @@ function DashboardContent() {
 
   return (
     <div className="flex-1 p-6 max-w-5xl mx-auto w-full">
-      <OnboardingSurvey />
+      {/* <OnboardingSurvey /> */}
       {showCheckoutBanner && checkoutState !== "dismissed" && (
         <CheckoutSuccessBanner
           state={checkoutState}

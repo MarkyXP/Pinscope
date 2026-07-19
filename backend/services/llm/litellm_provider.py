@@ -9,20 +9,27 @@ Caching: LiteLLM passes through ``cache_control`` markers for providers
 that support it (Anthropic, OpenAI). This provider does not enforce
 per-request breakpoint limits — that logic is provider-specific and
 handled by the upstream SDK.
+
+PDF handling: If the model supports native PDF input, the PDF is sent as-is.
+Otherwise the provider falls back to images (via pymupdf) if the model
+supports vision, or to plain text extraction if neither is available.
 """
 
 from __future__ import annotations
 
 import base64
 import importlib.util
+import json
 import logging
 import sys
 from pathlib import Path
-from types import ModuleType
 from typing import Any
 
 import litellm
+import pymupdf
+from litellm.utils import supports_pdf_input, supports_vision
 
+from backend.config import settings
 from backend.services.llm.base import LLMProvider, LLMSession
 from backend.services.llm.types import (
     Completion,
@@ -62,11 +69,39 @@ def _encode_pdf_block(path: Path | str) -> dict:
     }
 
 
-def _to_litellm_block(b: ContentBlock) -> dict:
+def _pdf_to_images(path: Path | str, dpi: int = 150) -> list[dict]:
+    """Render every page of a PDF to PNG images at the given DPI.
+
+    Returns a list of LiteLLM-compatible image blocks.
+    """
+    doc = pymupdf.open(str(path))
+    blocks: list[dict] = []
+    zoom = dpi / 72.0  # PDF default is 72 DPI
+    mat = pymupdf.Matrix(zoom, zoom, 0, 0)
+    for page in doc:
+        pix = page.get_pixmap(matrix=mat)
+        img_b64 = base64.standard_b64encode(pix.tobytes("png")).decode()
+        blocks.append({
+            "type": "image_url",
+            "image_url": {"url": f"data:image/png;base64,{img_b64}"},
+        })
+    doc.close()
+    return blocks
+
+
+def _pdf_to_text(path: Path | str) -> str:
+    """Extract plain text from every page of a PDF."""
+    doc = pymupdf.open(str(path))
+    texts = [page.get_text() for page in doc]
+    doc.close()
+    return "\n\n".join(texts)
+
+
+def _to_litellm_block(b: ContentBlock, model: str) -> dict | list[dict]:
     if isinstance(b, TextBlock):
         return {"type": "text", "text": b.text}
     if isinstance(b, PdfBlock):
-        return _encode_pdf_block(b.path)
+        return _handle_pdf_block(b, model)
     if isinstance(b, ToolCall):
         return {"type": "tool_use", "id": b.id, "name": b.name, "input": b.input}
     if isinstance(b, ToolResultBlock):
@@ -78,8 +113,40 @@ def _to_litellm_block(b: ContentBlock) -> dict:
     raise TypeError(f"Unknown ContentBlock: {type(b).__name__}")
 
 
-def _to_litellm_message(m: Message) -> dict:
-    return {"role": m.role, "content": [_to_litellm_block(b) for b in m.content]}
+def _handle_pdf_block(b: PdfBlock, model: str) -> dict | list[dict]:
+    """Decide how to encode a PdfBlock based on model capabilities.
+
+    Priority: native PDF → images (if vision) → text extraction.
+    """
+    if supports_pdf_input(model=model):
+        return _encode_pdf_block(b.path)
+
+    if supports_vision(model=model):
+        dpi = settings.pdf_render_dpi
+        log.warning(
+            "Model '%s' does not support native PDF input — rendering as images "
+            "at %s DPI via pymupdf",
+            model,
+            dpi,
+        )
+        return _pdf_to_images(b.path, dpi=dpi)
+
+    log.warning(
+        "Model '%s' does not support PDF or vision — extracting text only",
+        model,
+    )
+    return {"type": "text", "text": _pdf_to_text(b.path)}
+
+
+def _to_litellm_message(m: Message, model: str) -> dict:
+    blocks: list[dict] = []
+    for b in m.content:
+        result = _to_litellm_block(b, model)
+        if isinstance(result, list):
+            blocks.extend(result)
+        else:
+            blocks.append(result)
+    return {"role": m.role, "content": blocks}
 
 
 def _to_litellm_tool(t: ToolSchema) -> dict:
@@ -106,16 +173,31 @@ def _from_litellm_response(resp) -> Completion:
     tool_calls: list[ToolCall] = []
     raw_blocks: list[ContentBlock] = []
 
-    for block in resp.content:
-        btype = getattr(block, "type", None)
-        if btype == "text":
-            text_parts.append(block.text)
-            raw_blocks.append(TextBlock(text=block.text))
-        elif btype == "tool_use":
-            tc = ToolCall(id=block.id, name=block.name, input=dict(block.input))
-            tool_calls.append(tc)
-            raw_blocks.append(tc)
-
+    # for block in resp.choices[0].message.content:
+    #     btype = getattr(block, "type", None)
+    #     if btype == "text":
+    #         text_parts.append(block.text)
+    #         raw_blocks.append(TextBlock(text=block.text))
+    #     elif btype == "tool_use":
+    #         tc = ToolCall(id=block.id, name=block.name, input=dict(block.input))
+    #         tool_calls.append(tc)
+    #         raw_blocks.append(tc)
+    text_parts = resp.choices[0].message.content or ""
+    print("--------------------------------------------------")
+    print(f"{resp}")
+    if resp.choices[0].message.tool_calls:
+        print(f"{resp.choices[0].message.tool_calls[0].id=}")
+        print(f"{resp.choices[0].message.tool_calls[0].function.name=}")
+        print(f"{resp.choices[0].message.tool_calls[0].function.arguments=}")
+    print("--------------------------------------------------")
+    tool_calls = [
+        ToolCall(
+            id = tool_call.id,
+            name = tool_call.function.name,
+            input = json.load(tool_call.function.arguments)["values"]
+        )
+        for tool_call in resp.choices[0].message.tool_calls or []
+    ]
     usage = resp.usage
     usage_obj = Usage(
         input_tokens=getattr(usage, "prompt_tokens", 0) or 0,
@@ -167,7 +249,7 @@ class LiteLLMSession(LLMSession):
     ) -> Completion:
         kwargs: dict[str, Any] = {
             "model": self.model,
-            "messages": [_to_litellm_message(m) for m in messages],
+            "messages": [_to_litellm_message(m, self.model) for m in messages],
             "stream": False,
         }
         if self._system:
@@ -185,6 +267,8 @@ class LiteLLMSession(LLMSession):
         kwargs.update(self._extra_kwargs)
 
         resp = await litellm.acompletion(**kwargs)
+        # print(kwargs, resp)
+        return _from_litellm_response(resp)
         return _from_litellm_response(resp.choices[0].message)
 
     async def close(self) -> None:
@@ -229,7 +313,7 @@ class LiteLLMProvider(LLMProvider):
 
     # Resolve skills/ directory relative to the project root
     # (same root that config.py uses: backend/../skills/)
-    _SKILLS_DIR = Path(__file__).resolve().parent.parent.parent / "skills"
+    _SKILLS_DIR = Path(__file__).resolve().parent.parent.parent.parent / "skills"
 
     async def run_skill(
         self,

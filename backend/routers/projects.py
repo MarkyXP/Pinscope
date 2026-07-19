@@ -777,8 +777,8 @@ async def auto_resolve(req: AutoResolveRequest, request: Request):
 
     if not settings.use_digikey:
         raise HTTPException(400, "DigiKey API not configured")
-    if not settings.anthropic_api_key:
-        raise HTTPException(400, "Anthropic API key not configured")
+    #if not settings.anthropic_api_key:
+    #    raise HTTPException(400, "Anthropic API key not configured")
 
     storage = get_storage(request)
     sem = asyncio.Semaphore(10)

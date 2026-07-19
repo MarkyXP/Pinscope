@@ -16,6 +16,7 @@ import os
 import subprocess
 import sys
 import threading
+from pathlib import Path
 from typing import Literal
 
 from backend.config import settings
@@ -68,8 +69,12 @@ def _spawn_local_subprocess(
     if regen_stages:
         env["REGEN_STAGES"] = ",".join(regen_stages)
     env["EXECUTION_NAME"] = name
+    pythonpath = str(Path(__file__).parent.parent.parent)
+    # env["PYTHONPATH"] = pythonpath
+    # Run the backend worker
+    cmd = [sys.executable, "-m", "backend.pipeline_worker"]
     proc = subprocess.Popen(
-        [sys.executable, "-m", "backend.pipeline_worker"],
+        cmd,
         env=env,
         # Inherit stdout/stderr so logs appear in the dev terminal
         stdin=subprocess.DEVNULL,

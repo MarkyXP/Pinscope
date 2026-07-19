@@ -385,6 +385,7 @@ async def review_ic_async(
                         tool_choice=tool_choice,
                     )
                     turns += 1
+                    print(f"{completion=}")
                     total_input += completion.usage.input_tokens
                     total_output += completion.usage.output_tokens
                     total_cache_creation += completion.usage.cache_creation_tokens

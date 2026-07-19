@@ -8,6 +8,7 @@ from __future__ import annotations
 import logging
 import time
 from dataclasses import dataclass, field
+import traceback
 
 import httpx
 
@@ -34,7 +35,7 @@ async def _get_access_token() -> str:
         return str(_token_cache["access_token"])
 
     base = _BASE_URLS.get(settings.digikey_environment, _BASE_URLS["production"])
-    async with httpx.AsyncClient(timeout=15) as client:
+    async with httpx.AsyncClient() as client:
         resp = await client.post(
             f"{base}/v1/oauth2/token",
             data={
@@ -90,7 +91,7 @@ async def _keyword_search(mpn: str) -> list[dict]:
         "ExcludeMarketPlaceProducts": True,
     }
 
-    async with httpx.AsyncClient(timeout=20) as client:
+    async with httpx.AsyncClient() as client:
         resp = await client.post(
             f"{base}/products/v4/search/keyword",
             headers=headers,
@@ -144,8 +145,11 @@ async def _download_pdf(url: str) -> bytes:
     Raises ValueError if the file isn't a valid PDF or is too small.
     Raises httpx.HTTPStatusError on 4xx/5xx responses.
     """
-    async with httpx.AsyncClient(timeout=15, follow_redirects=True) as client:
-        resp = await client.get(url)
+    HEADERS = {
+        "User-Agent": "Mozilla/5.0 (X11; Linux x86_64; rv:152.0) Gecko/20100101 Firefox/152.0"
+    }
+    async with httpx.AsyncClient(timeout=30, follow_redirects=True) as client:
+        resp = await client.get(url, headers=HEADERS)
         resp.raise_for_status()
         data = resp.content
 
@@ -306,6 +310,7 @@ async def fetch_params(mpn: str) -> ParamsFetchResult:
         return ParamsFetchResult(mpn, error=f"DigiKey search failed ({e.response.status_code})")
     except Exception as e:
         msg = str(e) or type(e).__name__
+        msg = traceback.format_exc()
         logger.warning("DigiKey search error for %s: %s", mpn, msg)
         return ParamsFetchResult(mpn, error=f"DigiKey search error: {msg}")
 

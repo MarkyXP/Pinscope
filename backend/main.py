@@ -155,3 +155,13 @@ if settings.billing_enabled:
 app.include_router(contact.router, prefix="/api")
 app.include_router(feedback.router, prefix="/api")
 app.include_router(survey.router, prefix="/api")
+
+
+if __name__ == "__main__":
+    import uvicorn
+
+    uvicorn.run(
+        app,
+        host="0.0.0.0",
+        port=8000
+    )

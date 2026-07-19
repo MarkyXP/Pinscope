@@ -56,6 +56,10 @@ class Settings(BaseSettings):
     fallback_model_auto_resolve: str = ""
     fallback_model_normalize: str = ""
 
+    # PDF → image render DPI (used by litellm_provider when a model doesn't
+    # support native PDF input but does support vision).
+    pdf_render_dpi: int = 150
+
     # Max parallel IC agents — the single knob controlling concurrency for
     # BOTH the IC pintable extraction stage and the direct datasheet review
     # stage. Change this one number (or the IC_CONCURRENCY env var) to scale
