@@ -9,7 +9,7 @@ FastAPI application providing async pipeline orchestration, project storage, and
 python3 -m uvicorn backend.main:app --reload    # localhost:8000
 ```
 
-Config reads from `.env` at project root (see `config.py`). Key settings: `ANTHROPIC_API_KEY`, `ANTHROPIC_MODEL` (default `claude-sonnet-4-6`), per-stage model overrides (`model_pintable`, `model_pattern`, `model_specs`, `model_validation`, `model_auto_resolve`), `CORS_ORIGINS`, `DIGIKEY_CLIENT_ID`, `DIGIKEY_CLIENT_SECRET`, `DIGIKEY_ENVIRONMENT`.
+Config reads from `.env` at project root (see `config.py`). Key settings: `LLM_API_KEY`, `LLM_PROVIDER` (default `anthropic`), per-stage model overrides (`model_pintable`, `model_pattern`, `model_specs`, `model_validation`, `model_auto_resolve`), `CORS_ORIGINS`, `DIGIKEY_CLIENT_ID`, `DIGIKEY_CLIENT_SECRET`, `DIGIKEY_ENVIRONMENT`.
 
 For local mode, leave `GCS_BUCKET` empty — uses `LocalStorageBackend` (`data/` directory) and no auth (user_id defaults to `"local"`, admin access granted).
 
@@ -21,7 +21,6 @@ backend/
 ├── config.py            # Pydantic Settings from .env
 ├── _version.py          # Reads app version from frontend/content/changelog.md (single source of truth)
 ├── Dockerfile           # Python 3.12-slim, copies taxonomy/ + changelog.md for runtime
-├── skills_manifest.json # Claude Console Skill IDs (extract-pintable, extract-pattern, extract-specs)
 ├── pinscopex/           # Core library (models, parsers, graph, validator, taxonomy, derating)
 │   ├── utils.py         # Shared utilities: safe_mpn(), natural_sort_key()
 │   └── resolve_passives.py  # Passive MPN pattern matching + value decoders (R/C/L)
@@ -40,7 +39,7 @@ backend/
     ├── storage_gcs.py        # GCSStorageBackend (optional, Google Cloud Storage)
     ├── projects.py           # Project CRUD + library ops via StorageBackend
     ├── pipeline.py           # Multi-stage orchestrator + EventBroker + PipelineWorkspace
-    ├── extraction.py         # Async Claude API calls (pintable, patterns, specs, auto-resolve, value fallback) + skills + page trimming
+    ├── extraction.py         # Async LiteLLM calls (pintable, patterns, specs, auto-resolve, value fallback) + local skills + page trimming
     ├── validation.py         # Async agentic validation wrapper with per-IC error isolation
     ├── normalize_findings.py # Post-review per-IC normalize pass (downgrade-only)
     ├── dedupe_findings.py    # Cross-IC finding dedup
@@ -103,7 +102,7 @@ Library lookups happen first — if an MPN was already extracted, it's reused wi
 The pipeline runs async via `asyncio.create_task()`. Progress emitted as SSE events via `EventBroker` (async queue per subscriber). `PipelineWorkspace` handles download/upload. Pipelines can be cancelled mid-run via `POST /api/pipeline/{id}/cancel`.
 
 1. **Parse BOM** — Read uploaded CSV/XLSX (uses stored column mappings from upload; XLSX converted to CSV via openpyxl)
-2. **Extract IC Pintables** — Async Claude API calls for pintable per IC MPN (datasheets keyword-trimmed via `pypdf`). Cache-miss MPNs are extracted **concurrently**, up to `IC_CONCURRENCY` (default 6) in flight at once.
+2. **Extract IC Pintables** — Async LLM calls for pintable per IC MPN (datasheets keyword-trimmed via `pypdf`). Cache-miss MPNs are extracted **concurrently**, up to `IC_CONCURRENCY` (default 6) in flight at once.
 2.5. **Extract Simple Components** — Specs extraction for discrete/simple components with datasheets
 3. **Extract Passives** — Pattern-based extraction per MPN group, then a specs fallback per MPN.
 3.5. **DigiKey Auto-Resolve (exact MPN)** — Fallback for unresolved passives; parameters mapped to taxonomy specs via Haiku. Requires exact MPN match so the shared `library/passives/` stays clean.
@@ -111,7 +110,7 @@ The pipeline runs async via `asyncio.create_task()`. Progress emitted as SSE eve
 4. **Build Graph** — Call `pinscopex.graph.build_graph()` with local temp paths
 5. **BOM Summary** — Collate components from design graph (no AI)
 6. **Derating Table** — Capacitor voltage derating computation (no AI)
-7. **Direct Datasheet Review** — Per-IC (isolated): Claude reads the datasheet PDF + circuit neighborhood from the graph, compares to reference application circuit, and submits findings via graph query tools. ICs are reviewed **concurrently**, up to `IC_CONCURRENCY` in flight at once.
+7. **Direct Datasheet Review** — Per-IC (isolated): LLM reads the datasheet PDF + circuit neighborhood from the graph, compares to reference application circuit, and submits findings via graph query tools. ICs are reviewed **concurrently**, up to `IC_CONCURRENCY` in flight at once.
 
 **Concurrency knob** — `IC_CONCURRENCY` (`config.py: ic_concurrency`, default 6) governs parallelism for stage 2 (IC extraction), stage 3.5 (passive specs fallback), and stage 7 (review). Set `IC_CONCURRENCY=1` for fully sequential behavior.
 
@@ -121,9 +120,8 @@ The pipeline runs async via `asyncio.create_task()`. Progress emitted as SSE eve
 - **PipelineWorkspace** — downloads to temp dir, runs pinscopex locally, uploads results
 - **BillingHook seam (open-core)** — core code reaches billing exclusively through `services/billing_hook.py:get_billing()`. In this repo that's `NullBilling`: every pipeline runs free and no billing routes are mounted. Never import billing modules directly from core code — go through the hook.
 - **Auth middleware** — JWT verification via a JWKS endpoint; disabled when `CLERK_JWKS_URL` is empty (local mode: `user_id="local"`, `is_admin()` returns True)
-- **AsyncAnthropic** for all Claude API calls — extraction and validation
-- **Claude Console Skills** — extraction uses managed skills (skill_id + version from `skills_manifest.json`); no fallback, raises error if skill not configured
-- **Prompt caching** — extraction and validation calls use `cache_control={"type": "ephemeral"}` on system prompts and input context
+- **LiteLLM** for all LLM calls — extraction and validation (any provider via `LLM_PROVIDER`)
+- **Local skills** — extraction uses skills from `skills/` directory (SKILL.md + schema.json + validate.py); loaded at runtime
 - **Forced tool calls** for extraction — structured output via `tool_choice`
 - **SSE via sse-starlette** — `EventBroker` manages per-project async queues with history replay
 - **API call logging** — `ApiLogger` in `services/api_logs.py` collects per-call metadata; `CallMeta` returned from extraction functions
@@ -140,7 +138,7 @@ The pipeline runs async via `asyncio.create_task()`. Progress emitted as SSE eve
 
 ## Guidelines
 
-- Keep all Claude API interaction in `services/extraction.py` and `services/validation.py`; logging in `services/api_logs.py`
+- Keep all LLM interaction in `services/extraction.py` and `services/validation.py`; logging in `services/api_logs.py`
 - Keep all storage operations in `services/projects.py` (uses `StorageBackend`)
 - Routers are thin — validate input, call service, return response
 - Thread `user_id` from `request.state` through to all service calls

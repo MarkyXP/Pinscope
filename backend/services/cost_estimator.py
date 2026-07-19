@@ -104,15 +104,28 @@ LOW_MULT: float = 0.7
 HIGH_MULT: float = 1.4
 
 
+def _resolve_provider_model(model_str: str) -> tuple[str, str]:
+    """Split a LiteLLM model string into (provider, model_name).
+
+    e.g. ``"anthropic/claude-sonnet-4-6"`` -> ``("anthropic", "claude-sonnet-4-6")``
+
+    Falls back to ``("anthropic", model_str)`` when there is no slash.
+    """
+    if "/" in model_str:
+        provider, model_name = model_str.split("/", 1)
+        return provider, model_name
+    return "anthropic", model_str
+
+
 def estimate_stage_cost_usd(stage: str) -> float:
     """Per-call USD for one sub-unit of ``stage``, model-aware.
 
-    Resolves provider+model from ``settings`` and computes
-    ``(input_tokens × rate) + ...`` using the same ``PRICING`` /
-    ``CACHE_RATES`` tables that real billing in
-    ``services.llm.pricing.cost_for_entry`` reads. Changing a
-    ``MODEL_*`` / ``PROVIDER_*`` env var therefore updates the estimate
-    automatically.
+    Resolves the model from ``settings.model_for_stage()``, splits the
+    LiteLLM model string (e.g. ``"anthropic/claude-sonnet-4-6"``) into
+    provider + model name, and computes ``(input_tokens × rate) + ...``
+    using the same ``PRICING`` / ``CACHE_RATES`` tables that real billing
+    in ``services.llm.pricing.cost_for_entry`` reads. Changing a
+    ``MODEL_*`` env var therefore updates the estimate automatically.
 
     Falls through to ``PRICING[provider]["default"]`` when the resolved
     model is missing from the table — same fallback semantics as the
@@ -123,10 +136,10 @@ def estimate_stage_cost_usd(stage: str) -> float:
     """
     base = STAGE_TOKEN_BASELINES[stage]
     settings_stage = str(base["settings_stage"])
-    provider = settings.provider_for_stage(settings_stage)
-    model = settings.model_for_stage(settings_stage)
+    model_str = settings.model_for_stage(settings_stage)
+    provider, model_name = _resolve_provider_model(model_str)
     table = PRICING.get(provider) or PRICING["anthropic"]
-    rates = table.get(model, table["default"])
+    rates = table.get(model_name, table["default"])
     cache = CACHE_RATES.get(provider, CACHE_RATES["anthropic"])
     return (
         int(base["input"]) * rates["input"]

@@ -24,16 +24,81 @@ A post-pass normalizes findings conservatively: it can merge duplicates and down
 
 It's a reviewer, not an oracle. It misses things, and it will occasionally question a choice you made on purpose — that's what the citations are for.
 
+## LLM Setup
+
+Pinscope uses [LiteLLM](https://docs.litellm.ai/) to talk to any LLM. Set `DEFAULT_MODEL` to a model string with a provider prefix, and your API key in the corresponding environment variable.
+
+### Supported providers
+
+| Provider | Model prefix | API key env var | Notes |
+|---|---|---|---|
+| Anthropic | `anthropic/...` | `ANTHROPIC_API_KEY` | Default provider |
+| OpenAI | `openai/...` | `OPENAI_API_KEY` | |
+| Google Gemini | `gemini/...` | `GOOGLE_API_KEY` | |
+| Ollama | `ollama/...` | *(none)* | Runs locally; see setup below |
+| llama.cpp / llamafile | `openai/...` (via local server) | *(none)* | Runs locally; see setup below |
+
+**Default model:** `anthropic/claude-sonnet-4-6`
+
+### Provider-specific setup
+
+**Anthropic** — [Get an API key](https://console.anthropic.com/) and set `ANTHROPIC_API_KEY`.
+
+**OpenAI** — [Get an API key](https://platform.openai.com/api-keys) and set `OPENAI_API_KEY`.
+
+**Google Gemini** — [Get an API key](https://aistudio.google.com/apikey) and set `GOOGLE_API_KEY`.
+
+**Ollama** — Install [Ollama](https://ollama.com), pull a model, and run it:
+```bash
+# Install Ollama (macOS/Linux)
+curl -fsSL https://ollama.com/install.sh | sh
+
+# Pull a model (Sonnet-class quality recommended)
+ollama pull llama3.1:70b
+
+# Run the server (default: http://localhost:11434)
+ollama serve
+```
+Then set `DEFAULT_MODEL=ollama/llama3.1:70b`. No API key needed. (If Ollama runs on a non-default port, set `OLLAMA_BASE_URL=http://localhost:<port>`.)
+
+**llama.cpp / llamafile** — Download a [llamafile](https://github.com/Mozilla-Ocho/llamafile), make it executable, and run it:
+```bash
+chmod +x llama-3.1-70b-instruct.Q4_K_M.llamafile
+./llama-3.1-70b-instruct.Q4_K_M.llamafile --server --host 0.0.0.0 --port 8080
+```
+Then set:
+```bash
+DEFAULT_MODEL=openai/llama-3.1-70b-instruct
+OPENAI_API_KEY=anything   # llamafile accepts any key
+OPENAI_BASE_URL=http://localhost:8080/v1
+```
+The `OPENAI_BASE_URL` points to the local llamafile server; `OPENAI_API_KEY` can be any string since llamafile doesn't require authentication.
+
+### Per-stage model overrides
+
+Each pipeline stage can use a different model. Set `MODEL_<STAGE>` to override the default for that stage:
+- `MODEL_VALIDATION` — IC review (the most expensive stage)
+- `MODEL_PINTABLE` — IC pin-table extraction
+- `MODEL_PATTERN` — passive component pattern extraction
+- `MODEL_SPECS` — simple component spec extraction
+- `MODEL_AUTO_RESOLVE` — DigiKey MPN auto-resolution
+- `MODEL_NORMALIZE` — findings normalization
+
+Example: use Sonnet for review but Haiku for auto-resolve:
+```bash
+DEFAULT_MODEL=anthropic/claude-sonnet-4-6
+MODEL_AUTO_RESOLVE=anthropic/claude-haiku-4-5-20251001
+```
+
 ## Try it on the bundled design
 
 `simple_project/` is a small MSPM0G3507 board with a CH340E USB-UART bridge and an SPX3819 LDO. Run it through and Pinscope flags, among other things, the LDO's bypass pin left unconnected (~300 µV<sub>RMS</sub> output noise instead of ~40) and the 5 V-powered CH340E driving the 3.3 V MCU directly — each with the page reference to check its work.
 
-You need Python 3.12+, Node 20+, and an [Anthropic API key](https://console.anthropic.com/):
+You need Python 3.12+, Node 20+, and an API key for your chosen provider (see above).
 
 ```bash
 pip install -r backend/requirements.txt
-cp backend/.env.example .env                 # set ANTHROPIC_API_KEY
-python3 scripts/upload_skills.py --update    # one-time: registers the extraction prompts under your account
+cp backend/.env.example .env                 # set your API key and model
 python3 -m uvicorn backend.main:app --reload
 cd frontend && npm install && npm run dev
 ```

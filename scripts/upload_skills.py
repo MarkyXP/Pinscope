@@ -1,186 +1,121 @@
 #!/usr/bin/env python3
-"""Upload or update extraction skills on the Claude Console platform.
+"""Verify that all local extraction skills are well-formed.
+
+Checks each skill directory under skills/ for:
+  - SKILL.md exists and is non-empty
+  - schema.json exists and is valid JSON
+  - validate.py exists and imports successfully (validate function callable)
 
 Usage:
-    python3 scripts/upload_skills.py              # Create new skills
-    python3 scripts/upload_skills.py --update      # Create new versions of existing skills
-    python3 scripts/upload_skills.py --list         # List current skills
-
-Requires ANTHROPIC_API_KEY environment variable.
-Reads/writes skill IDs to backend/skills_manifest.json.
+    python3 scripts/upload_skills.py          # Verify all skills
+    python3 scripts/upload_skills.py --list    # List discovered skills
 """
 
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import json
-import os
 import sys
 from pathlib import Path
 
-import anthropic
-
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
-
-# Load API key from backend .env if not already in environment
-_env_file = PROJECT_ROOT / "backend" / ".env"
-if _env_file.exists() and not os.environ.get("ANTHROPIC_API_KEY"):
-    for line in _env_file.read_text().splitlines():
-        line = line.strip()
-        if line.startswith("ANTHROPIC_API_KEY=") and not line.startswith("#"):
-            os.environ["ANTHROPIC_API_KEY"] = line.split("=", 1)[1].strip().strip("'\"")
-            break
 SKILLS_DIR = PROJECT_ROOT / "skills"
-MANIFEST_PATH = PROJECT_ROOT / "backend" / "skills_manifest.json"
 
-SKILLS = [
-    {
-        "directory": "extract-pintable",
-        "display_title": "Extract Pin Table",
-    },
-    {
-        "directory": "extract-pattern",
-        "display_title": "Extract Passive Pattern",
-    },
-    {
-        "directory": "extract-specs",
-        "display_title": "Extract Component Specs",
-    },
-]
+REQUIRED_FILES = {"SKILL.md", "schema.json", "validate.py"}
 
 
-def load_manifest() -> dict:
-    if MANIFEST_PATH.exists():
-        return json.loads(MANIFEST_PATH.read_text())
-    return {}
+def discover_skills() -> list[str]:
+    """Find all skill directories under skills/."""
+    if not SKILLS_DIR.is_dir():
+        return []
+    return sorted(
+        entry.name
+        for entry in SKILLS_DIR.iterdir()
+        if entry.is_dir() and (entry / "SKILL.md").exists()
+    )
 
 
-def save_manifest(manifest: dict) -> None:
-    MANIFEST_PATH.write_text(json.dumps(manifest, indent=2) + "\n")
-    print(f"\nManifest written to {MANIFEST_PATH}")
+def verify_skill(name: str) -> list[str]:
+    """Verify a single skill. Returns a list of error messages (empty = OK)."""
+    errors: list[str] = []
+    skill_dir = SKILLS_DIR / name
 
+    # Check required files
+    for required in REQUIRED_FILES:
+        target = skill_dir / required
+        if not target.exists():
+            errors.append(f"  MISSING: {required}")
+        elif target.is_file() and target.stat().st_size == 0:
+            errors.append(f"  EMPTY: {required}")
 
-def skill_file_tuples(directory: str) -> list[tuple[str, bytes]]:
-    """Return (directory/filename, content) tuples for all files in a skill directory.
-
-    The API requires files to be in a top-level directory with SKILL.md at its root.
-    """
-    skill_dir = SKILLS_DIR / directory
-    files = []
-    for path in sorted(skill_dir.iterdir()):
-        if path.is_file():
-            files.append((f"{directory}/{path.name}", path.read_bytes()))
-    return files
-
-
-def _bump_minor_version(v: str) -> str:
-    """Bump the minor segment of a semver string, reset patch to 0."""
-    major, minor, patch = v.split(".")
-    return f"{major}.{int(minor) + 1}.0"
-
-
-def create_skills(client: anthropic.Anthropic) -> None:
-    """Create new skills on the platform."""
-    manifest = load_manifest()
-
-    # Initialize default_model_version if absent
-    if "default_model_version" not in manifest:
-        manifest["default_model_version"] = "1.0.0"
-        print(f"  Initialized default_model_version: 1.0.0")
-
-    for skill in SKILLS:
-        name = skill["directory"]
-        if name in manifest:
-            print(f"  {name}: already exists (skill_id={manifest[name]['skill_id']}), skipping. Use --update to create a new version.")
-            continue
-
-        print(f"  Creating {name}...")
-        files = skill_file_tuples(name)
-        result = client.beta.skills.create(
-            display_title=skill["display_title"],
-            files=files,
-        )
-        manifest[name] = {
-            "skill_id": result.id,
-            "latest_version": result.latest_version,
-            "display_title": skill["display_title"],
-        }
-        print(f"    skill_id: {result.id}")
-        print(f"    version:  {result.latest_version}")
-
-    save_manifest(manifest)
-
-
-def update_skills(client: anthropic.Anthropic) -> None:
-    """Create new versions for existing skills."""
-    manifest = load_manifest()
-
-    for skill in SKILLS:
-        name = skill["directory"]
-        if name not in manifest:
-            print(f"  {name}: not yet created, run without --update first.")
-            continue
-
-        skill_id = manifest[name]["skill_id"]
-        print(f"  Updating {name} (skill_id={skill_id})...")
-        files = skill_file_tuples(name)
-        result = client.beta.skills.versions.create(
-            skill_id=skill_id,
-            files=files,
-        )
-        manifest[name]["latest_version"] = result.version
-        print(f"    new version: {result.version}")
-
-    # Bump default_model_version minor (new skill → new extraction schema)
-    old_v = manifest.get("default_model_version", "1.0.0")
-    new_v = _bump_minor_version(old_v)
-    manifest["default_model_version"] = new_v
-    print(f"\n  default_model_version bumped: {old_v} → {new_v}")
-
-    save_manifest(manifest)
-
-
-def list_skills(client: anthropic.Anthropic) -> None:
-    """List skills on the platform."""
-    manifest = load_manifest()
-    if not manifest:
-        print("  No skills in manifest. Run without flags to create them.")
-        return
-
-    for name, info in manifest.items():
-        skill_id = info["skill_id"]
-        print(f"\n  {name}:")
-        print(f"    skill_id: {skill_id}")
+    # Validate schema.json
+    schema_path = skill_dir / "schema.json"
+    if schema_path.exists() and schema_path.stat().st_size > 0:
         try:
-            skill = client.beta.skills.retrieve(skill_id)
-            print(f"    display_title: {skill.display_title}")
-            print(f"    latest_version: {skill.latest_version}")
-            versions = client.beta.skills.versions.list(skill_id=skill_id)
-            print(f"    versions: {[v.version for v in versions.data]}")
-        except Exception as e:
-            print(f"    error: {e}")
+            data = json.loads(schema_path.read_text())
+            if not isinstance(data, dict):
+                errors.append("  schema.json: root is not a JSON object")
+        except json.JSONDecodeError as exc:
+            errors.append(f"  schema.json: invalid JSON — {exc}")
 
-    print(f"\n  Manifest: {MANIFEST_PATH}")
+    # Validate validate.py imports and exposes validate()
+    validate_path = skill_dir / "validate.py"
+    if validate_path.exists() and validate_path.stat().st_size > 0:
+        try:
+            spec = importlib.util.spec_from_file_location(
+                f"skill_validate_{name}", validate_path
+            )
+            if spec and spec.loader:
+                mod = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(mod)
+                if not hasattr(mod, "validate") or not callable(mod.validate):
+                    errors.append("  validate.py: no callable validate() found")
+        except Exception as exc:
+            errors.append(f"  validate.py: import error — {exc}")
+
+    return errors
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Upload extraction skills to Claude Console")
-    group = parser.add_mutually_exclusive_group()
-    group.add_argument("--update", action="store_true", help="Create new versions of existing skills")
-    group.add_argument("--list", action="store_true", help="List current skills and versions")
+    parser = argparse.ArgumentParser(
+        description="Verify local extraction skills are well-formed"
+    )
+    parser.add_argument(
+        "--list", action="store_true", help="List discovered skills and exit"
+    )
     args = parser.parse_args()
 
-    client = anthropic.Anthropic()  # uses ANTHROPIC_API_KEY env var
+    skills = discover_skills()
+    if not skills:
+        print("No skills found under skills/")
+        sys.exit(1)
 
     if args.list:
-        print("Listing skills...")
-        list_skills(client)
-    elif args.update:
-        print("Updating skills (new versions)...")
-        update_skills(client)
+        print(f"Discovered {len(skills)} skill(s):")
+        for name in skills:
+            print(f"  - {name}")
+        sys.exit(0)
+
+    # Verify mode
+    print(f"Verifying {len(skills)} skill(s)...\n")
+    all_ok = True
+    for name in skills:
+        errors = verify_skill(name)
+        if errors:
+            print(f"FAIL: {name}")
+            for err in errors:
+                print(err)
+            all_ok = False
+        else:
+            print(f"OK:   {name}")
+
+    print()
+    if all_ok:
+        print(f"All {len(skills)} skill(s) verified.")
     else:
-        print("Creating skills...")
-        create_skills(client)
+        print("Some skills have issues. Fix the above before running.")
+        sys.exit(1)
 
 
 if __name__ == "__main__":

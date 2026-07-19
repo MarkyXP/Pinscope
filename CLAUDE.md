@@ -22,7 +22,7 @@ Three layers:
 | **Backend** | `backend/` | FastAPI app — async pipeline orchestration, SSE progress, project/file storage |
 | **Frontend** | `frontend/` | Next.js 16 app — project dashboard, pipeline progress, report viewer, derating, admin dashboard |
 
-Plus `skills/` — Claude Console Skills for datasheet extraction (pintable, patterns, specs).
+Plus `skills/` — local extraction skills for datasheet parsing (pintable, patterns, specs).
 
 The pipeline stages: Parse BOM → Extract IC Pintables → Extract Simple Components → Extract Passives → DigiKey Auto-Resolve + Value Fallback → Build Graph → Direct Datasheet Review. Pipeline runs can be cancelled mid-execution via `POST /api/pipeline/{id}/cancel`.
 
@@ -42,9 +42,8 @@ Files: `.asc` (PADS-PCB netlist; `.edn` EDIF 2.0.0 also accepted), `.csv`/`.xlsx
 
 - **Modular extractors** — Domain-specific extraction per component type, unified constraint schema
 - **Netlist as graph** — Queryable bipartite graph (components + nets) with traversal helpers
-- **Claude API for PDF extraction** — Forced tool calls for structured output (pintable, passive patterns, specs)
-- **Prompt caching** — Extraction and review API calls use `cache_control={"type": "ephemeral"}` on system prompts and input context to reduce cost on repeated calls
-- **Claude Console Skills** — Extraction prompts deployed as managed skills; skill_ids and versions loaded from `backend/skills_manifest.json` (upload your own via `scripts/upload_skills.py`)
+- **LiteLLM for PDF extraction** — Forced tool calls for structured output (pintable, passive patterns, specs) via any LLM provider
+- **Local extraction skills** — Extraction prompts live in `skills/` as SKILL.md + schema.json + validate.py; loaded and validated at runtime (no cloud upload)
 - **Direct datasheet review** — Claude reads the IC datasheet PDF and circuit neighborhood together, compares to reference application circuit, and flags issues via graph query tools (`find_connected_components`, `get_net_for_pin`, `get_pintable`)
 - **Datasheet page trimming** — Large PDFs are keyword-trimmed to relevant pages before sending to Claude, reducing token cost (`pypdf`)
 - **DigiKey fallback (exact MPN only)** — When pattern-based and direct extraction fail, DigiKey API fetches product parameters for auto-resolve. DigiKey matches only on exact MPN; fuzzy hits are rejected to avoid polluting the shared library with wrong-dielectric / wrong-voltage parts.
@@ -75,9 +74,9 @@ Per-MPN IC extraction captures:
 For discrete/simple components:
 4. **Specs** — Component specs (value, tolerance, package, voltage rating, etc.); parameters are filtered against taxonomy specs schemas
 
-Extraction uses **Claude Console Skills** (required, via `skill_id` in `backend/skills_manifest.json`). No inline fallback — raises error if skill not configured. Skills are defined in `skills/` and uploaded via `scripts/upload_skills.py` — run it once against your own Anthropic Console account to populate the manifest with your skill IDs.
+Extraction uses **local skills** from `skills/`. Each skill has a SKILL.md (system prompt), schema.json (output schema), and validate.py (validation function). Skills are loaded at runtime — no cloud upload or manifest needed.
 
-## Claude Console Skills
+## Local Skills
 
 ```
 skills/
@@ -101,7 +100,7 @@ Key taxonomy features:
 
 ## Scripts
 
-- `scripts/upload_skills.py` — Create, update, or list Claude Console Skills. Reads/writes skill IDs to `backend/skills_manifest.json`
+- `scripts/upload_skills.py` — Verify local skills are well-formed (checks SKILL.md, schema.json, validate.py)
 - `scripts/migrate_datasheets_to_library.py` — One-time migration: copy per-project datasheets to `library/datasheets/` (dry-run by default, `--apply` to execute)
 - `scripts/migrate_datasheets_to_blobs.py` — Migrate named-PDF datasheets into the content-addressed blobs/refs layout (dry-run by default, `--apply` to execute)
 - `scripts/dedup_library_datasheets.py` — Remove redundant per-MPN datasheet PDFs when a passive pattern already has a `datasheet_key` (dry-run by default, `--apply` to execute)
@@ -110,22 +109,22 @@ Key taxonomy features:
 
 ## Tech Stack
 
-- **Core**: Python 3.12+, Pydantic 2.x, Anthropic SDK (async + sync), openpyxl (XLSX BOM support), pypdf (datasheet page trimming)
+- **Core**: Python 3.12+, Pydantic 2.x, LiteLLM (any LLM provider), openpyxl (XLSX BOM support), pypdf (datasheet page trimming)
 - **Backend**: FastAPI, uvicorn, sse-starlette, pydantic-settings
 - **Frontend**: Next.js 16 (App Router, Turbopack), React 19, Tailwind CSS v4, shadcn/ui (Base UI), react-pdf
-- **AI**: Claude API with forced tool calls for extraction, direct datasheet review for validation
-- **Model**: `claude-sonnet-4-6` default for extraction and review, `claude-haiku-4-5` for DigiKey auto-resolve and passive value fallback (per-stage overrides via `.env`)
-- **Skills**: Claude Console Skills API for managed extraction prompts (3 active skills: pintable, pattern, specs)
+- **AI**: LiteLLM with forced tool calls for extraction, direct datasheet review for validation (any provider)
+- **Model**: `anthropic/claude-sonnet-4-6` default (LiteLLM format), per-stage overrides via `.env`
+- **Skills**: Local extraction skills in `skills/` (3 active: pintable, pattern, specs)
 - **External APIs**: DigiKey API v4 (OAuth2) — optional datasheet auto-fetch and parameter-based auto-resolve (`DIGIKEY_CLIENT_ID`, `DIGIKEY_CLIENT_SECRET`)
 
 ## Extracted Model Versioning
 
 All `ComponentConstraints` extracted JSON files carry a `model_version` semver field:
 
-- **Initial value** — set from `default_model_version` in `backend/skills_manifest.json` (starts at `1.0.0`)
-- **Minor bump** — `default_model_version` in `skills_manifest.json` is incremented by `scripts/upload_skills.py --update`, so all new extractions after a skill update start at the new minor (e.g. `1.0.0` → `1.1.0`)
+- **Initial value** — hardcoded in `backend/config.py` as `1.0.0`
+- **Bump** — change the hardcoded value in `config.py` when skill schemas change
 
-**Rule**: When committing or pushing changes under `skills/`, run `python3 scripts/upload_skills.py --update` before the commit/push to sync skill versions and bump `default_model_version`.
+**Rule**: When committing changes under `skills/` that change the extraction schema, bump the version in `config.py` and re-extract affected components.
 
 ## Development Guidelines
 
@@ -133,7 +132,7 @@ All `ComponentConstraints` extracted JSON files carry a `model_version` semver f
 - Netlist parser and BOM parser are pure functions with no side effects
 - All data structures use Pydantic models in `backend/pinscopex/models.py`
 - Frontend types in `frontend/src/lib/types.ts` must stay in sync with `backend/pinscopex/models.py`
-- Extraction prompts live in `skills/` as Claude Console Skills (SKILL.md + schema.json + validate.py)
+- Extraction prompts live in `skills/` as local skills (SKILL.md + schema.json + validate.py)
 - **Never swallow exceptions silently** — prefer logging or re-raising over bare `except: continue`. Silent failures hide real bugs.
 
 ## Running

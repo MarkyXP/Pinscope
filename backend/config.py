@@ -1,7 +1,6 @@
 """Backend configuration via environment variables."""
 
 import importlib.util
-import json
 from pathlib import Path
 
 from pydantic import Field
@@ -11,42 +10,34 @@ from pydantic_settings import BaseSettings
 _BACKEND_DIR = Path(__file__).resolve().parent
 _PROJECT_ROOT = _BACKEND_DIR.parent
 
-# Load skills manifest once at import time
-_MANIFEST_PATH = _BACKEND_DIR / "skills_manifest.json"
-_SKILLS_MANIFEST: dict = (
-    json.loads(_MANIFEST_PATH.read_text()) if _MANIFEST_PATH.exists() else {}
-)
+# Skills directory — skills are now local (SKILL.md + schema.json + validate.py)
+_SKILLS_DIR = _PROJECT_ROOT / "skills"
 
 
 class Settings(BaseSettings):
-    # Anthropic
+    # API key — kept for backward compat. LiteLLM reads the key from the
+    # env var that matches the model provider (e.g. ANTHROPIC_API_KEY for
+    # "anthropic/..." models, OPENAI_API_KEY for "openai/..." models).
     anthropic_api_key: str = ""
-    anthropic_model: str = "claude-sonnet-4-6"
 
-    # Per-stage model overrides (fall back to anthropic_model if empty)
+    # Default model in LiteLLM format (e.g. "anthropic/claude-sonnet-4-6").
+    # Per-stage overrides fall back to this value.
+    default_model: str = "anthropic/claude-sonnet-4-6"
+
+    # Per-stage model overrides (LiteLLM format — e.g. "openai/gpt-4o").
+    # Fall back to default_model if empty.
     model_pintable: str = ""
     model_pattern: str = ""
     model_specs: str = ""
-    model_validation: str = "claude-sonnet-4-6"
-    model_auto_resolve: str = "claude-haiku-4-5-20251001"
-    model_normalize: str = "claude-sonnet-4-6"
-
-    # Gemini (set GEMINI_API_KEY to enable)
-    gemini_api_key: str = ""
-    gemini_model: str = "gemini-3.1-pro-preview"
-
-    # Per-stage Gemini model overrides (fall back to gemini_model if empty)
-    model_validation_gemini: str = ""
-    model_pintable_gemini: str = ""
-    model_pattern_gemini: str = ""
-    model_specs_gemini: str = ""
-    model_auto_resolve_gemini: str = ""
-    model_normalize_gemini: str = ""
+    model_validation: str = "anthropic/claude-sonnet-4-6"
+    model_auto_resolve: str = "anthropic/claude-haiku-4-5-20251001"
+    model_normalize: str = "anthropic/claude-sonnet-4-6"
 
     # Provider routing — provider_default is the global default; per-stage
-    # overrides win when non-empty. Set provider_validation=gemini to route
-    # the validation stage to Gemini while leaving extraction on Anthropic.
-    provider_default: str = "anthropic"
+    # overrides win when non-empty. Kept for backward compat; with LiteLLM
+    # the provider is determined by the model prefix, so this field is
+    # mostly cosmetic.
+    provider_default: str = "litellm"
     provider_pintable: str = ""
     provider_pattern: str = ""
     provider_specs: str = ""
@@ -54,17 +45,10 @@ class Settings(BaseSettings):
     provider_auto_resolve: str = ""
     provider_normalize: str = ""
 
-    # Per-stage fallback provider/model — used if the primary stage call
-    # raises (e.g. Gemini 503 UNAVAILABLE). Leave empty to disable fallback
-    # for that stage. If fallback_provider_<stage> is set but
-    # fallback_model_<stage> is empty, the fallback uses that provider's
-    # default model (anthropic_model or gemini_model).
-    fallback_provider_pintable: str = ""
-    fallback_provider_pattern: str = ""
-    fallback_provider_specs: str = ""
-    fallback_provider_validation: str = ""
-    fallback_provider_auto_resolve: str = ""
-    fallback_provider_normalize: str = ""
+    # Per-stage fallback model — used if the primary stage call raises.
+    # Leave empty to disable fallback for that stage. If
+    # fallback_model_<stage> is set but empty, the fallback uses
+    # default_model.
     fallback_model_pintable: str = ""
     fallback_model_pattern: str = ""
     fallback_model_specs: str = ""
@@ -183,49 +167,52 @@ class Settings(BaseSettings):
         return bool(self.email_sender and self.email_frontend_url)
 
     def provider_for_stage(self, stage: str) -> str:
-        """Return the LLM provider name for a pipeline stage."""
+        """Return the LLM provider name for a pipeline stage.
+
+        With LiteLLM this is always "litellm" — the model prefix determines
+        the actual provider. Kept for backward compat with call sites that
+        expect a provider name.
+        """
         override = getattr(self, f"provider_{stage}", "")
         return override or self.provider_default
 
     def model_for_stage(self, stage: str) -> str:
-        """Return the model for a pipeline stage, provider-aware.
+        """Return the model for a pipeline stage (LiteLLM format).
 
-        For Anthropic: falls back to model_<stage>, then anthropic_model.
-        For Gemini:    falls back to model_<stage>_gemini, then gemini_model.
+        Falls back to model_<stage>, then default_model.
         """
-        provider = self.provider_for_stage(stage)
-        if provider == "gemini":
-            override = getattr(self, f"model_{stage}_gemini", "")
-            return override or self.gemini_model
         override = getattr(self, f"model_{stage}", "")
-        return override or self.anthropic_model
+        return override or self.default_model
 
-    def fallback_for_stage(self, stage: str) -> tuple[str, str] | None:
-        """Return (provider, model) for the stage's fallback, or None if no
-        fallback is configured. Used by call_with_fallback() to retry once
-        when the primary provider raises.
+    def fallback_for_stage(self, stage: str) -> str | None:
+        """Return the fallback model for the stage, or None if no fallback
+        is configured. Used by call_with_fallback() to retry once with a
+        different model when the primary call raises.
         """
-        fb_provider = getattr(self, f"fallback_provider_{stage}", "")
-        if not fb_provider:
-            return None
         fb_model = getattr(self, f"fallback_model_{stage}", "")
         if not fb_model:
-            fb_model = self.gemini_model if fb_provider == "gemini" else self.anthropic_model
-        return (fb_provider, fb_model)
+            fb_model = self.default_model
+        return fb_model if fb_model else None
 
     def get_default_model_version(self) -> str:
-        """Return the default model_version for new extractions from skills_manifest.json."""
-        return _SKILLS_MANIFEST.get("default_model_version", "1.0.0")
+        """Return the default model_version for new extractions."""
+        return "1.0.0"
 
     def get_skill(self, name: str) -> tuple[str, str]:
-        """Return (skill_id, version) from skills_manifest.json or raise."""
-        entry = _SKILLS_MANIFEST.get(name)
-        if not entry:
+        """Return (skill_name, skill_dir_path) for a local skill.
+
+        Validates that the skill directory exists with the required files.
+        Returns a 2-tuple for backward compat with existing call sites
+        (which unpack as ``skill_id, version = settings.get_skill(...)``,
+        and only use the first element for logging).
+        """
+        skill_dir = _SKILLS_DIR / name
+        if not (skill_dir / "SKILL.md").exists():
             raise RuntimeError(
-                f"Skill '{name}' not found in {_MANIFEST_PATH}. "
-                f"Run scripts/upload_skills.py to create skills."
+                f"Skill '{name}' not found at {skill_dir}. "
+                f"Ensure skills/{name}/SKILL.md exists."
             )
-        return entry["skill_id"], entry["latest_version"]
+        return name, str(skill_dir)
 
 
 settings = Settings()

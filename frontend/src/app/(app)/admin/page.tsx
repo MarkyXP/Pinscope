@@ -1558,7 +1558,7 @@ function SettingsPanel() {
               Current extraction version
             </div>
             <div className="text-xs text-muted-foreground">
-              From skills_manifest.json (read-only)
+              Hardcoded in backend config (read-only)
             </div>
           </div>
           <Badge variant="secondary" className="font-mono">

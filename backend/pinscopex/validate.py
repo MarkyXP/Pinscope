@@ -7,18 +7,13 @@ component's circuit neighborhood together and flags issues directly.
 
 from __future__ import annotations
 
-import base64
+import asyncio
 import json
 import re
 import sys
 from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
-
-import anthropic
-from dotenv import load_dotenv
-
-load_dotenv()
 
 from backend.pinscopex.models import (
     ComponentConstraints,
@@ -38,6 +33,16 @@ from backend.pinscopex.validation_tools import (
     _is_thermal_pad_pin,
     _pin_sort_key,
     _reviewer_voltage_str,
+)
+from backend.services.llm.factory import get_provider
+from backend.services.llm.types import (
+    Completion,
+    Message,
+    PdfBlock,
+    TextBlock,
+    ToolCall,
+    ToolResultBlock,
+    ToolSchema,
 )
 
 
@@ -690,21 +695,6 @@ def build_component_context(
 
 
 # ---------------------------------------------------------------------------
-# PDF helper
-# ---------------------------------------------------------------------------
-
-
-def _pdf_content_block(pdf_path: str) -> dict:
-    """Build a Claude API document block from a PDF file."""
-    data = base64.standard_b64encode(Path(pdf_path).read_bytes()).decode()
-    return {
-        "type": "document",
-        "source": {"type": "base64", "media_type": "application/pdf", "data": data},
-        "cache_control": {"type": "ephemeral"},
-    }
-
-
-# ---------------------------------------------------------------------------
 # Per-IC review
 # ---------------------------------------------------------------------------
 
@@ -718,74 +708,108 @@ class ReviewResult:
         self.checked_areas = checked_areas
 
 
-def review_component(
-    client: anthropic.Anthropic,
+def _dict_to_tool_schema(tool_dict: dict) -> ToolSchema:
+    """Convert an Anthropic-style tool dict to a ToolSchema dataclass."""
+    return ToolSchema(
+        name=tool_dict["name"],
+        description=tool_dict.get("description", ""),
+        input_schema=tool_dict.get("input_schema", {}),
+    )
+
+
+async def review_component_async(
     graph: DesignGraph,
     constraints_map: ConstraintsMap,
     ic_ref: str,
     pdf_path: str,
-    model: str = "claude-sonnet-4-6",
+    model: str = "anthropic/claude-sonnet-4-6",
 ) -> ReviewResult:
-    """Review an IC's usage against its datasheet.  Returns findings + coverage."""
+    """Review an IC's usage against its datasheet.  Returns findings + coverage.
+
+    Async version using the unified LiteLLM provider.
+    """
     comp = graph.components[ic_ref]
     mpn = comp.mpn or comp.value
     context = build_component_context(graph, constraints_map, ic_ref)
 
-    user_content: list[dict] = [
-        _pdf_content_block(pdf_path),
-        {
-            "type": "text",
-            "text": f"Review this component's usage:\n\n{context}",
-            "cache_control": {"type": "ephemeral"},
-        },
-    ]
+    # Build user message with PDF + text
+    user_blocks: list = [PdfBlock(path=Path(pdf_path))]
+    user_blocks.append(TextBlock(text=f"Review this component's usage:\n\n{context}"))
+    user_msg = Message(role="user", content=user_blocks)
 
-    messages: list[dict] = [{"role": "user", "content": user_content}]
+    messages: list[Message] = [user_msg]
 
-    for turn in range(_MAX_REVIEW_TURNS):
-        is_last_turn = turn == _MAX_REVIEW_TURNS - 1
+    provider = get_provider("validation")
+    session = await provider.create_session(
+        model=model,
+        system=SYSTEM_PROMPT,
+        max_tokens=4096,
+        temperature=0.0,
+    )
 
-        # On the last turn, force submit_review
-        if is_last_turn:
-            tools = [SUBMIT_REVIEW_SCHEMA]
-            tool_choice = {"type": "tool", "name": "submit_review"}
-        else:
-            tools = ALL_TOOLS
-            tool_choice = {"type": "auto"}
+    try:
+        for turn in range(_MAX_REVIEW_TURNS):
+            is_last_turn = turn == _MAX_REVIEW_TURNS - 1
 
-        response = client.messages.create(
-            model=model,
-            max_tokens=4096,
-            system=[{"type": "text", "text": SYSTEM_PROMPT, "cache_control": {"type": "ephemeral"}}],
-            tools=tools,
-            tool_choice=tool_choice,
-            messages=messages,
-        )
+            # On the last turn, force submit_review
+            if is_last_turn:
+                tools = [_dict_to_tool_schema(SUBMIT_REVIEW_SCHEMA)]
+                tool_choice = {"name": "submit_review"}
+            else:
+                tools = [_dict_to_tool_schema(t) for t in ALL_TOOLS]
+                tool_choice = "auto"
 
-        # Check for submit_review
-        for block in response.content:
-            if block.type == "tool_use" and block.name == "submit_review":
-                return _parse_review(block.input, ic_ref, mpn)
+            completion: Completion = await session.complete(
+                messages=messages,
+                tools=tools,
+                tool_choice=tool_choice,
+            )
 
-        # Process graph tool calls
-        tool_results = []
-        for block in response.content:
-            if block.type == "tool_use":
-                result_text = execute_tool(graph, constraints_map, block.name, block.input)
-                tool_results.append({
-                    "type": "tool_result",
-                    "tool_use_id": block.id,
-                    "content": result_text,
-                })
+            # Check for submit_review
+            for tc in completion.tool_calls:
+                if tc.name == "submit_review":
+                    return _parse_review(tc.input, ic_ref, mpn)
 
-        if not tool_results:
-            # Model responded with text only — no tools called, no submission
-            break
+            # Process graph tool calls
+            tool_result_blocks: list[ToolResultBlock] = []
+            for tc in completion.tool_calls:
+                if tc.name != "submit_review":
+                    result_text = execute_tool(
+                        graph, constraints_map, tc.name, tc.input
+                    )
+                    tool_result_blocks.append(
+                        ToolResultBlock(
+                            tool_use_id=tc.id,
+                            name=tc.name,
+                            content=result_text,
+                        )
+                    )
 
-        messages.append({"role": "assistant", "content": response.content})
-        messages.append({"role": "user", "content": tool_results})
+            if not tool_result_blocks:
+                # Model responded with text only — no tools called, no submission
+                break
+
+            # Append assistant response + tool results to conversation
+            messages.append(Message(role="assistant", content=completion.raw_assistant_blocks))
+            messages.append(Message(role="user", content=tool_result_blocks))
+
+    finally:
+        await session.close()
 
     return ReviewResult([], [])  # No findings submitted
+
+
+def review_component(
+    graph: DesignGraph,
+    constraints_map: ConstraintsMap,
+    ic_ref: str,
+    pdf_path: str,
+    model: str = "anthropic/claude-sonnet-4-6",
+) -> ReviewResult:
+    """Sync wrapper around review_component_async for CLI use."""
+    return asyncio.run(
+        review_component_async(graph, constraints_map, ic_ref, pdf_path, model)
+    )
 
 
 def _coerce_str_list(value) -> list[str]:
@@ -930,7 +954,7 @@ def validate_design(
     pdf_dir: str,
     output_path: str = "report.json",
     datasheets_dir: str = "datasheets/extracted",
-    model: str = "claude-sonnet-4-6",
+    model: str = "anthropic/claude-sonnet-4-6",
 ) -> ValidationReport:
     """Load graph, review every IC against its datasheet, write report."""
     from backend.pinscopex.utils import safe_mpn
@@ -940,7 +964,6 @@ def validate_design(
     datasheets = _load_datasheets(datasheets_dir)
     constraints_map = _build_constraints_map(datasheets)
 
-    client = anthropic.Anthropic()
     all_findings: list[Finding] = []
     all_coverage: dict[str, list[str]] = {}
 
@@ -959,7 +982,7 @@ def validate_design(
 
         print(f"Reviewing {ref} ({mpn}) ...", flush=True)
         result = review_component(
-            client, graph, constraints_map, ref, str(pdf_path), model=model,
+            graph, constraints_map, ref, str(pdf_path), model=model,
         )
         all_findings.extend(result.findings)
         if result.checked_areas:
