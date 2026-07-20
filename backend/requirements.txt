@@ -16,4 +16,6 @@ PyJWT[crypto]>=2.8
 cryptography>=42.0
 packaging>=23.0
 # httpx2>=2.7.0
-orjson
+orjson>=3.11.9
+pip-system-certs>=5.3
+pymupdf

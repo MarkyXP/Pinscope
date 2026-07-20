@@ -3,18 +3,35 @@
 import logging
 import os
 from contextlib import asynccontextmanager
+from pathlib import Path
 
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+import pip_system_certs.wrapt_requests
 from starlette.middleware.base import BaseHTTPMiddleware
+from dotenv import load_dotenv
+
+# ------------------------------------------------------------------
+#  SSL - Patch certifi package to the the local machine cert store
+# ------------------------------------------------------------------
+pip_system_certs.wrapt_requests.inject_truststore()
 
 from backend.config import settings
-from backend.routers import admin, contact, feedback, pipeline, projects, reports, survey
+from backend.routers import (
+    admin,
+    contact,
+    feedback,
+    pipeline,
+    projects,
+    reports,
+    survey,
+)
 from backend.services.projects import ProjectNotFound
 from backend.services.storage import LocalStorageBackend
 
 logger = logging.getLogger(__name__)
+load_dotenv(Path(__file__).parent / ".env")
 
 # Default user ID for unauthenticated local dev
 LOCAL_DEV_USER = "local"
@@ -134,6 +151,7 @@ app.add_middleware(
     expose_headers=["X-Datasheet-Url"],
 )
 
+
 @app.exception_handler(ProjectNotFound)
 async def _project_not_found_handler(request: Request, exc: ProjectNotFound):
     # A mutation raced a project deletion (or hit never-fully-created metadata).
@@ -160,8 +178,4 @@ app.include_router(survey.router, prefix="/api")
 if __name__ == "__main__":
     import uvicorn
 
-    uvicorn.run(
-        app,
-        host="0.0.0.0",
-        port=8000
-    )
+    uvicorn.run(app, host="0.0.0.0", port=8000)

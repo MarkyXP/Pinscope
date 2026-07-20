@@ -81,10 +81,12 @@ def _pdf_to_images(path: Path | str, dpi: int = 150) -> list[dict]:
     for page in doc:
         pix = page.get_pixmap(matrix=mat)
         img_b64 = base64.standard_b64encode(pix.tobytes("png")).decode()
-        blocks.append({
-            "type": "image_url",
-            "image_url": {"url": f"data:image/png;base64,{img_b64}"},
-        })
+        blocks.append(
+            {
+                "type": "image_url",
+                "image_url": {"url": f"data:image/png;base64,{img_b64}"},
+            }
+        )
     doc.close()
     return blocks
 
@@ -150,11 +152,14 @@ def _to_litellm_message(m: Message, model: str) -> dict:
 
 
 def _to_litellm_tool(t: ToolSchema) -> dict:
-    return {"type": "function", "function": {
-        "name": t.name,
-        "description": t.description,
-        "parameters": t.input_schema,
-    }}
+    return {
+        "type": "function",
+        "function": {
+            "name": t.name,
+            "description": t.description,
+            "parameters": t.input_schema,
+        },
+    }
 
 
 def _to_litellm_tool_choice(c: ToolChoice) -> dict | str | None:
@@ -192,9 +197,9 @@ def _from_litellm_response(resp) -> Completion:
     print("--------------------------------------------------")
     tool_calls = [
         ToolCall(
-            id = tool_call.id,
-            name = tool_call.function.name,
-            input = json.load(tool_call.function.arguments)["values"]
+            id=tool_call.id,
+            name=tool_call.function.name,
+            input=json.loads(tool_call.function.arguments),  # ["values"]
         )
         for tool_call in resp.choices[0].message.tool_calls or []
     ]
@@ -203,16 +208,18 @@ def _from_litellm_response(resp) -> Completion:
         input_tokens=getattr(usage, "prompt_tokens", 0) or 0,
         output_tokens=getattr(usage, "completion_tokens", 0) or 0,
         cache_creation_tokens=getattr(usage, "prompt_tokens_details", None)
-            and getattr(usage.prompt_tokens_details, "cached_tokens", 0) or 0,
+        and getattr(usage.prompt_tokens_details, "cached_tokens", 0)
+        or 0,
         cache_read_tokens=getattr(usage, "completion_tokens_details", None)
-            and getattr(usage.completion_tokens_details, "cached_tokens", 0) or 0,
+        and getattr(usage.completion_tokens_details, "cached_tokens", 0)
+        or 0,
     )
 
     return Completion(
         text="".join(text_parts),
         tool_calls=tool_calls,
         usage=usage_obj,
-        stop_reason=getattr(resp, "finish_reason", "unknown") or "unknown",
+        stop_reason=resp.choices[0].finish_reason,
         raw_assistant_blocks=raw_blocks,
     )
 
@@ -347,7 +354,7 @@ class LiteLLMProvider(LLMProvider):
         if raw.startswith("---"):
             end = raw.find("---", 3)
             if end != -1:
-                skill_prompt = raw[end + 3:].lstrip("\n")
+                skill_prompt = raw[end + 3 :].lstrip("\n")
 
         # Combine skill prompt with caller's dynamic system context
         combined_system = f"{skill_prompt}\n\n{system}"
@@ -387,9 +394,7 @@ class LiteLLMProvider(LLMProvider):
         validate_fn = self._load_validate(skill_dir)
         errors = validate_fn(data)
         if errors:
-            log.warning(
-                "Skill '%s' validation failed: %s", skill_name, errors
-            )
+            log.warning("Skill '%s' validation failed: %s", skill_name, errors)
             # Return data anyway — caller may decide to retry or accept
 
         return data, completion
@@ -399,9 +404,7 @@ class LiteLLMProvider(LLMProvider):
         """Dynamically import validate(data: dict) -> list[str] from a skill's validate.py."""
         validate_py = skill_dir / "validate.py"
         if not validate_py.exists():
-            log.warning(
-                "No validate.py at %s — skipping validation", validate_py
-            )
+            log.warning("No validate.py at %s — skipping validation", validate_py)
             return lambda data: []  # no-op validator
 
         spec = importlib.util.spec_from_file_location(
