@@ -52,41 +52,69 @@ log = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 
-def _encode_pdf_block(path: Path | str) -> dict:
+def _encode_pdf_block(path: Path | str, model: str) -> dict | list[dict]:
     """Encode a PDF file as a base64 data-URI document block.
 
     LiteLLM normalises this to the provider's native format
     (Anthropic ``document``, OpenAI ``image_url``, etc.).
+
+    For Azure, large PDFs are split into ≤50-page chunks; each chunk
+    becomes a separate file block, so this may return a list.
+
+    Docs: https://docs.litellm.ai/docs/completion/document_understanding
     """
-    data = base64.standard_b64encode(Path(path).read_bytes()).decode()
+    if model.startswith("azure/"):
+        from backend.services.llm.azure_file_upload import upload_azure_file
+
+        p = Path(path)
+        file_ids = upload_azure_file(p)
+        blocks = [{"type": "file", "file": {"file_id": fid}} for fid in file_ids]
+        return blocks if len(blocks) > 1 else blocks[0]
+
+    encoded_file = base64.b64encode(Path(path).read_bytes()).decode()
+    base64_url = f"data:application/pdf;base64,{encoded_file}"
     return {
-        "type": "document",
-        "source": {
-            "type": "base64",
-            "media_type": "application/pdf",
-            "data": data,
-        },
+        "type": "file",
+        "file": {"file_data": base64_url},
     }
 
 
-def _pdf_to_images(path: Path | str, dpi: int = 150) -> list[dict]:
-    """Render every page of a PDF to PNG images at the given DPI.
+def _pdf_to_images(
+    path: Path | str, dpi: int = 150, max_images: int = 50
+) -> list[dict]:
+    """Render pages of a PDF to PNG images at the given DPI.
 
-    Returns a list of LiteLLM-compatible image blocks.
+    Returns a list of LiteLLM-compatible image blocks. If the PDF has more
+    pages than ``max_images``, the excess pages are appended as a single
+    text block so no content is lost.
+
+    Docs: https://docs.litellm.ai/docs/completion/vision
     """
     doc = pymupdf.open(str(path))
     blocks: list[dict] = []
     zoom = dpi / 72.0  # PDF default is 72 DPI
     mat = pymupdf.Matrix(zoom, zoom, 0, 0)
-    for page in doc:
-        pix = page.get_pixmap(matrix=mat)
-        img_b64 = base64.standard_b64encode(pix.tobytes("png")).decode()
-        blocks.append(
-            {
-                "type": "image_url",
-                "image_url": {"url": f"data:image/png;base64,{img_b64}"},
-            }
+    for i, page in enumerate(doc):
+        if i < max_images:
+            pix = page.get_pixmap(matrix=mat)
+            img_b64 = base64.standard_b64encode(pix.tobytes("png")).decode()
+            blocks.append(
+                {
+                    "type": "image_url",
+                    "image_url": {"url": f"data:image/png;base64,{img_b64}"},
+                }
+            )
+    # Append remaining pages as text if we hit the image limit
+    if len(doc) > max_images:
+        log.warning(
+            "PDF has %d pages but image limit is %d — appending pages %d–%d as text",
+            len(doc),
+            max_images,
+            max_images + 1,
+            len(doc),
         )
+        overflow_texts = [doc[i].get_text() for i in range(max_images, len(doc))]
+        blocks.append({"type": "text", "text": "\n\n".join(overflow_texts)})
     doc.close()
     return blocks
 
@@ -121,7 +149,7 @@ def _handle_pdf_block(b: PdfBlock, model: str) -> dict | list[dict]:
     Priority: native PDF → images (if vision) → text extraction.
     """
     if supports_pdf_input(model=model):
-        return _encode_pdf_block(b.path)
+        return _encode_pdf_block(b.path, model=model)
 
     if supports_vision(model=model):
         dpi = settings.pdf_render_dpi
