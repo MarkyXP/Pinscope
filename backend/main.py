@@ -174,6 +174,12 @@ app.include_router(contact.router, prefix="/api")
 app.include_router(feedback.router, prefix="/api")
 app.include_router(survey.router, prefix="/api")
 
+# Debug-only endpoints — only when APP_VERSION is not set (i.e. debug mode)
+if settings.is_debug:
+    from backend.routers import debug
+
+    app.include_router(debug.router)
+
 
 if __name__ == "__main__":
     import uvicorn

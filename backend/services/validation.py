@@ -144,7 +144,7 @@ _REVIEW_KEYWORDS = re.compile(
     re.IGNORECASE,
 )
 
-_MAX_PDF_PAGES = 90
+_MAX_PDF_PAGES = 45
 
 # Per-review excerpt budget — keeps fan-out cost bounded on hub ICs (e.g. an
 # MCU connected to many neighbors). On exhaustion, the tool returns a budget

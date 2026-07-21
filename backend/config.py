@@ -1,6 +1,8 @@
 """Backend configuration via environment variables."""
 
 import importlib.util
+import os
+from datetime import datetime
 from pathlib import Path
 
 from pydantic import Field
@@ -145,6 +147,19 @@ class Settings(BaseSettings):
         "env_file_encoding": "utf-8",
         "extra": "ignore",
     }
+
+    @property
+    def app_version(self) -> str:
+        """Return the app version, defaulting to DEBUG_yyyymmdd_hhmmss."""
+        version = os.getenv("APP_VERSION", "").strip()
+        if not version:
+            version = f"DEBUG_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        return version
+
+    @property
+    def is_debug(self) -> bool:
+        """True when APP_VERSION is not set (i.e. we're running in debug mode)."""
+        return not os.getenv("APP_VERSION", "").strip()
 
     @property
     def use_stripe(self) -> bool:

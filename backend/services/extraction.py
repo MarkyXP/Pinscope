@@ -208,7 +208,7 @@ SPECS_TOOL = {
 # ---------------------------------------------------------------------------
 
 
-_MAX_PDF_PAGES = 90
+_MAX_PDF_PAGES = 45
 
 log = logging.getLogger(__name__)
 
@@ -353,7 +353,7 @@ async def _generate_type_specs(
     )
 
     async def _call(provider, model):
-        session = await provider.create_session(model=model, system=system, max_tokens=1024)
+        session = await provider.create_session(model=model, system=system, max_tokens=10_000)
         t0 = time.monotonic()
         try:
             completion = await session.complete(
@@ -422,7 +422,7 @@ async def _generate_extra_specs(
     )
 
     async def _call(provider, model):
-        session = await provider.create_session(model=model, system=system, max_tokens=1024)
+        session = await provider.create_session(model=model, system=system, max_tokens=10_000)
         t0 = time.monotonic()
         try:
             completion = await session.complete(
@@ -844,7 +844,7 @@ async def auto_resolve_specs(
 
     async def _call(provider, model_name):
         session = await provider.create_session(
-            model=model_name, system=system, max_tokens=1024,
+            model=model_name, system=system, max_tokens=10_000,
         )
         t0 = time.monotonic()
         try:

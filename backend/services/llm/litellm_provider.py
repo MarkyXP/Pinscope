@@ -165,7 +165,7 @@ def _handle_pdf_block(b: PdfBlock, model: str) -> dict | list[dict]:
         "Model '%s' does not support PDF or vision — extracting text only",
         model,
     )
-    return {"type": "text", "text": _pdf_to_text(b.path)}
+    return {"type": "text", "text": "# " + b.path.name + "\n\n" + _pdf_to_text(b.path)}
 
 
 def _to_litellm_message(m: Message, model: str) -> dict:
@@ -216,13 +216,14 @@ def _from_litellm_response(resp) -> Completion:
     #         tool_calls.append(tc)
     #         raw_blocks.append(tc)
     text_parts = resp.choices[0].message.content or ""
-    print("--------------------------------------------------")
-    print(f"{resp}")
-    if resp.choices[0].message.tool_calls:
-        print(f"{resp.choices[0].message.tool_calls[0].id=}")
-        print(f"{resp.choices[0].message.tool_calls[0].function.name=}")
-        print(f"{resp.choices[0].message.tool_calls[0].function.arguments=}")
-    print("--------------------------------------------------")
+    if settings.is_debug:
+        print("--------------------------------------------------")
+        print(f"{resp}")
+        if resp.choices[0].message.tool_calls:
+            print(f"{resp.choices[0].message.tool_calls[0].id=}")
+            print(f"{resp.choices[0].message.tool_calls[0].function.name=}")
+            print(f"{resp.choices[0].message.tool_calls[0].function.arguments=}")
+        print("--------------------------------------------------")
     tool_calls = [
         ToolCall(
             id=tool_call.id,
