@@ -9,11 +9,14 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import re
 import sys
 from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
+
+log = logging.getLogger(__name__)
 
 from backend.pinscopex.models import (
     ComponentConstraints,
@@ -44,7 +47,6 @@ from backend.services.llm.types import (
     ToolResultBlock,
     ToolSchema,
 )
-
 
 # ---------------------------------------------------------------------------
 # System prompt
@@ -465,7 +467,9 @@ def build_component_context(
     unmatched_ep_entries: list = []  # pintable EP rows whose number isn't in schematic
 
     if constraints and constraints.pintable:
-        for p in sorted(constraints.pintable, key=lambda x: _pin_sort_key(str(x.number))):
+        for p in sorted(
+            constraints.pintable, key=lambda x: _pin_sort_key(str(x.number))
+        ):
             net_name = comp.pins.get(str(p.number))
             if net_name is not None:
                 matched_schematic_pins.add(str(p.number))
@@ -495,13 +499,15 @@ def build_component_context(
     if len(unmatched_ep_entries) == 1 and len(orphan_pins) == 1:
         ep_row = unmatched_ep_entries[0]
         orphan_pin = orphan_pins[0]
-        pin_entries.append((
-            orphan_pin,
-            ep_row.name,
-            comp.pins[orphan_pin],
-            fused_ep_note,
-            ep_row.functions,
-        ))
+        pin_entries.append(
+            (
+                orphan_pin,
+                ep_row.name,
+                comp.pins[orphan_pin],
+                fused_ep_note,
+                ep_row.functions,
+            )
+        )
         unmatched_ep_entries = []
         orphan_pins = []
 
@@ -545,20 +551,29 @@ def build_component_context(
 
         # Collect neighbors on this net (excluding self)
         neighbors = [
-            pc for pc in net.pins
+            pc
+            for pc in net.pins
             if pc.component_ref != ref and pc.component_ref in graph.components
         ]
 
         # For large ground/power nets, summarize
-        if len(neighbors) > _GROUND_NET_MAX_COMPONENTS and net.net_type in (NetType.GROUND, NetType.POWER):
+        if len(neighbors) > _GROUND_NET_MAX_COMPONENTS and net.net_type in (
+            NetType.GROUND,
+            NetType.POWER,
+        ):
             # Group by type
             by_type: dict[str, list[str]] = {}
             for pc in neighbors:
                 nb = graph.components[pc.component_ref]
                 ctype = nb.component_type.value
                 by_type.setdefault(ctype, []).append(pc.component_ref)
-            parts = [f"{len(refs)} {ctype}{'s' if len(refs) > 1 else ''}" for ctype, refs in sorted(by_type.items())]
-            lines.append(f"  {len(neighbors)} components on this net: {', '.join(parts)}")
+            parts = [
+                f"{len(refs)} {ctype}{'s' if len(refs) > 1 else ''}"
+                for ctype, refs in sorted(by_type.items())
+            ]
+            lines.append(
+                f"  {len(neighbors)} components on this net: {', '.join(parts)}"
+            )
             # Still list ICs specifically since they're important
             for pc in neighbors:
                 nb = graph.components[pc.component_ref]
@@ -569,7 +584,9 @@ def build_component_context(
                         p = nb_constraints.pin_by_number(pc.pin_number)
                         if p:
                             pin_name_str = f" ({p.name})"
-                    lines.append(f"  {nb.reference}: {nb.mpn or nb.value} [pin {pc.pin_number}{pin_name_str}]")
+                    lines.append(
+                        f"  {nb.reference}: {nb.mpn or nb.value} [pin {pc.pin_number}{pin_name_str}]"
+                    )
         else:
             for pc in neighbors:
                 nb = graph.components[pc.component_ref]
@@ -681,9 +698,7 @@ def build_component_context(
                 lines.append(f"  Pin {pn} → {net_name}")
                 continue
             voltage_str = _reviewer_voltage_str(net)
-            lines.append(
-                f"  Pin {pn} → {net_name} [{net.net_type.value}{voltage_str}]"
-            )
+            lines.append(f"  Pin {pn} → {net_name} [{net.net_type.value}{voltage_str}]")
         if not orphan_pins and unmatched_ep_entries:
             lines.append(
                 "  (no matching orphan schematic pin found — the EP may be "
@@ -701,6 +716,7 @@ def build_component_context(
 
 class ReviewResult:
     """Findings + coverage from a single IC review."""
+
     __slots__ = ("findings", "checked_areas")
 
     def __init__(self, findings: list[Finding], checked_areas: list[str]):
@@ -790,7 +806,9 @@ async def review_component_async(
                 break
 
             # Append assistant response + tool results to conversation
-            messages.append(Message(role="assistant", content=completion.raw_assistant_blocks))
+            messages.append(
+                Message(role="assistant", content=completion.raw_assistant_blocks)
+            )
             messages.append(Message(role="user", content=tool_result_blocks))
 
     finally:
@@ -830,7 +848,9 @@ def _coerce_str_list(value) -> list[str]:
         try:
             parsed = json.loads(s)
             if isinstance(parsed, list):
-                return [str(x).strip() for x in parsed if x is not None and str(x).strip()]
+                return [
+                    str(x).strip() for x in parsed if x is not None and str(x).strip()
+                ]
         except (json.JSONDecodeError, ValueError):
             pass
         return [s]
@@ -878,18 +898,20 @@ def _parse_review(
             else:
                 src_designator = None
                 src_mpn = mpn
-            findings.append(Finding(
-                designator=ic_ref,
-                mpn=mpn,
-                source_designator=src_designator,
-                finding=item["finding"],
-                why=item.get("why", ""),
-                status=item["status"],
-                source_page=page,
-                source_quote=item.get("source_quote", ""),
-                recommendation=item.get("recommendation", ""),
-                reference=f"{src_mpn} datasheet p.{page if page is not None else '?'}",
-            ))
+            findings.append(
+                Finding(
+                    designator=ic_ref,
+                    mpn=mpn,
+                    source_designator=src_designator,
+                    finding=item["finding"],
+                    why=item.get("why", ""),
+                    status=item["status"],
+                    source_page=page,
+                    source_quote=item.get("source_quote", ""),
+                    recommendation=item.get("recommendation", ""),
+                    reference=f"{src_mpn} datasheet p.{page if page is not None else '?'}",
+                )
+            )
         except (KeyError, TypeError, ValueError) as exc:
             print(f"Skipping malformed finding for {ic_ref}: {exc}", file=sys.stderr)
             continue
@@ -917,7 +939,11 @@ def _load_datasheets(directory: str | Path) -> dict[str, ComponentConstraints]:
     if not dirpath.is_dir():
         return result
     for f in dirpath.glob("*.json"):
-        raw = json.loads(f.read_text())
+        text = f.read_text().strip()
+        if not text:
+            log.warning("Empty datasheet JSON: %s", f)
+            continue
+        raw = json.loads(text)
         c = ComponentConstraints.model_validate(raw)
         result[c.mpn] = c
     return result
@@ -939,7 +965,9 @@ def _match_constraints(
     return None
 
 
-def _build_constraints_map(datasheets: dict[str, ComponentConstraints]) -> ConstraintsMap:
+def _build_constraints_map(
+    datasheets: dict[str, ComponentConstraints],
+) -> ConstraintsMap:
     """Build MPN -> constraints map for tool lookups."""
     return dict(datasheets)
 
@@ -982,15 +1010,21 @@ def validate_design(
 
         print(f"Reviewing {ref} ({mpn}) ...", flush=True)
         result = review_component(
-            graph, constraints_map, ref, str(pdf_path), model=model,
+            graph,
+            constraints_map,
+            ref,
+            str(pdf_path),
+            model=model,
         )
         all_findings.extend(result.findings)
         if result.checked_areas:
             all_coverage[ref] = result.checked_areas
-        print(f"  {len(result.findings)} findings: "
-              f"{sum(1 for f in result.findings if f.status == 'ERROR')} ERROR, "
-              f"{sum(1 for f in result.findings if f.status == 'WARNING')} WARNING, "
-              f"{sum(1 for f in result.findings if f.status == 'INFO')} INFO")
+        print(
+            f"  {len(result.findings)} findings: "
+            f"{sum(1 for f in result.findings if f.status == 'ERROR')} ERROR, "
+            f"{sum(1 for f in result.findings if f.status == 'WARNING')} WARNING, "
+            f"{sum(1 for f in result.findings if f.status == 'INFO')} INFO"
+        )
         if result.checked_areas:
             print(f"  Checked OK: {', '.join(result.checked_areas)}")
 

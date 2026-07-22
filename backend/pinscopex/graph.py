@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import re
 from pathlib import Path
+from logging import getLogger
 
 from backend.pinscopex.utils import safe_mpn
 from backend.pinscopex.models import (
@@ -23,7 +24,16 @@ from backend.pinscopex.models import (
 # Datasheets are loaded here for pin-name enrichment during graph build,
 # but NOT embedded into the graph. The validator loads them separately.
 from backend.pinscopex.parsers import parse_bom, parse_netlist_any
-from backend.pinscopex.resolve_passives import SkippedItem, resolve_bom, resolved_to_specs
+from backend.pinscopex.resolve_passives import (
+    SkippedItem,
+    resolve_bom,
+    resolved_to_specs,
+)
+
+# ---------------------------------------------------------------------------
+# Logging
+# ---------------------------------------------------------------------------
+logger = getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Component type classification
@@ -53,13 +63,16 @@ _PREFIX_TYPE: dict[str, ComponentType] = {
 # EE convention (e.g. pure-numeric refs like "4", descriptive refs like
 # "CV GND", "CAN BUS IN", "12V ACTIVE"). Order matters — first match wins.
 _FOOTPRINT_TYPE_PATTERNS: list[tuple[re.Pattern, ComponentType]] = [
-    (re.compile(
-        r"(?i)(?:^|[\s_])("
-        r"CONN(?:_|\b)|TERM(?:\b|_BLK)|HEADER|SOCKET|JACK|RECEPTACLE|PLUG|"
-        r"SCREW\s*TERM|PINHEADER|BARREL|BANANA|XT30|XT60|XT90|USB|"
-        r"WURTH\s*746\d|TE\s*282834|TE\s*2828\d|MOLEX|JST"
-        r")"
-    ), ComponentType.CONNECTOR),
+    (
+        re.compile(
+            r"(?i)(?:^|[\s_])("
+            r"CONN(?:_|\b)|TERM(?:\b|_BLK)|HEADER|SOCKET|JACK|RECEPTACLE|PLUG|"
+            r"SCREW\s*TERM|PINHEADER|BARREL|BANANA|XT30|XT60|XT90|USB|"
+            r"WURTH\s*746\d|TE\s*282834|TE\s*2828\d|MOLEX|JST"
+            r")"
+        ),
+        ComponentType.CONNECTOR,
+    ),
     (re.compile(r"(?i)TestPoint|TEST[_\s]POINT|\bTP_"), ComponentType.TEST_POINT),
     (re.compile(r"(?i)^LED[\s_]|\bLED\s+\d{3,4}"), ComponentType.DISCRETE),
     (re.compile(r"(?i)^CAP[\s_]|\bCAP_|CAPACITOR"), ComponentType.CAPACITOR),
@@ -126,8 +139,19 @@ def _parse_rail_voltage(name: str) -> float | None:
 
 # Net name prefixes that indicate power rails (case-insensitive)
 _POWER_PREFIXES = (
-    "VCC", "VDD", "VBUS", "VBAT", "VSYS", "VSUP", "VPWR",
-    "AVDD", "DVDD", "AVCC", "DVCC", "PVDD", "PVCC",
+    "VCC",
+    "VDD",
+    "VBUS",
+    "VBAT",
+    "VSYS",
+    "VSUP",
+    "VPWR",
+    "AVDD",
+    "DVDD",
+    "AVCC",
+    "DVCC",
+    "PVDD",
+    "PVCC",
     "V_",
 )
 
@@ -163,7 +187,9 @@ def _infer_net_properties(name: str) -> tuple[NetType, float | None]:
 # ---------------------------------------------------------------------------
 
 
-def _load_datasheets(directory: str | Path) -> dict[str, tuple[Path, ComponentConstraints]]:
+def _load_datasheets(
+    directory: str | Path,
+) -> dict[str, tuple[Path, ComponentConstraints]]:
     """Load all extracted datasheet JSONs, keyed by MPN."""
     result: dict[str, tuple[Path, ComponentConstraints]] = {}
     dirpath = Path(directory)
@@ -171,7 +197,11 @@ def _load_datasheets(directory: str | Path) -> dict[str, tuple[Path, ComponentCo
         return result
 
     for json_file in dirpath.glob("*.json"):
-        raw = json.loads(json_file.read_text())
+        text = json_file.read_text().strip()
+        if not text:
+            logger.warning("Empty datasheet JSON: %s", json_file)
+            continue
+        raw = json.loads(text)
         constraints = ComponentConstraints.model_validate(raw)
         result[constraints.mpn] = (json_file, constraints)
 
@@ -225,9 +255,7 @@ def _save_component_model(mpn: str, specs: ComponentSpecs, directory: Path) -> N
     directory.mkdir(parents=True, exist_ok=True)
     safe_name = safe_mpn(mpn)
     model = ComponentModel(mpn=mpn, specs=specs)
-    (directory / f"{safe_name}.json").write_text(
-        model.model_dump_json(indent=2) + "\n"
-    )
+    (directory / f"{safe_name}.json").write_text(model.model_dump_json(indent=2) + "\n")
 
 
 # ---------------------------------------------------------------------------
@@ -274,7 +302,13 @@ def build_graph(
     mpn_specs: dict[str, ComponentSpecs] = _load_component_models(models_dir)
     mpn_subtype: dict[str, str] = {}  # MPN -> component_subtype from patterns
 
-    for rp in resolve_bom(bom_path, patterns_dir, reference_col=reference_col, mpn_col=mpn_col, skipped=skipped):
+    for rp in resolve_bom(
+        bom_path,
+        patterns_dir,
+        reference_col=reference_col,
+        mpn_col=mpn_col,
+        skipped=skipped,
+    ):
         if rp.component_subtype:
             mpn_subtype[rp.mpn] = rp.component_subtype
         if rp.mpn not in mpn_specs:
@@ -358,11 +392,13 @@ def build_graph(
                     if pin_obj:
                         pin_name = pin_obj.name
 
-            pin_connections.append(PinConnection(
-                component_ref=ref,
-                pin_number=pin_num,
-                pin_name=pin_name,
-            ))
+            pin_connections.append(
+                PinConnection(
+                    component_ref=ref,
+                    pin_number=pin_num,
+                    pin_name=pin_name,
+                )
+            )
 
         nets[net_name] = Net(
             name=net_name,

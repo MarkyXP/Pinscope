@@ -17,10 +17,12 @@ supports vision, or to plain text extraction if neither is available.
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import importlib.util
 import json
 import logging
+import random
 import sys
 from pathlib import Path
 from typing import Any
@@ -52,24 +54,21 @@ log = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 
-def _encode_pdf_block(path: Path | str, model: str) -> dict | list[dict]:
+def _encode_pdf_block(path: Path | str, model: str) -> dict:
     """Encode a PDF file as a base64 data-URI document block.
 
     LiteLLM normalises this to the provider's native format
     (Anthropic ``document``, OpenAI ``image_url``, etc.).
 
-    For Azure, large PDFs are split into ≤50-page chunks; each chunk
-    becomes a separate file block, so this may return a list.
+    For Azure, the PDF is uploaded as a file and referenced by ID.
 
     Docs: https://docs.litellm.ai/docs/completion/document_understanding
     """
     if model.startswith("azure/"):
         from backend.services.llm.azure_file_upload import upload_azure_file
 
-        p = Path(path)
-        file_ids = upload_azure_file(p)
-        blocks = [{"type": "file", "file": {"file_id": fid}} for fid in file_ids]
-        return blocks if len(blocks) > 1 else blocks[0]
+        file_id = upload_azure_file(Path(path))
+        return {"type": "file", "file": {"file_id": file_id}}
 
     encoded_file = base64.b64encode(Path(path).read_bytes()).decode()
     base64_url = f"data:application/pdf;base64,{encoded_file}"
@@ -168,6 +167,20 @@ def _handle_pdf_block(b: PdfBlock, model: str) -> dict | list[dict]:
     return {"type": "text", "text": "# " + b.path.name + "\n\n" + _pdf_to_text(b.path)}
 
 
+def _is_openai_compat(model: str) -> bool:
+    """Return True when the target provider expects OpenAI-format messages.
+
+    Anthropic (native, Bedrock, Vertex) uses its own tool_use/tool_result
+    content-block schema.  Every other provider (Azure, OpenAI, Gemini via
+    OpenAI compat, …) expects the OpenAI function-call / tool-role schema.
+    """
+    return not (
+        model.startswith("anthropic/")
+        or "bedrock/anthropic" in model
+        or model.startswith("vertex_ai/claude")
+    )
+
+
 def _to_litellm_message(m: Message, model: str) -> dict:
     blocks: list[dict] = []
     for b in m.content:
@@ -177,6 +190,69 @@ def _to_litellm_message(m: Message, model: str) -> dict:
         else:
             blocks.append(result)
     return {"role": m.role, "content": blocks}
+
+
+def _to_litellm_messages(messages: list[Message], model: str) -> list[dict]:
+    """Convert a list of Messages to LiteLLM dicts.
+
+    For Anthropic-native models the existing per-block encoding is used
+    unchanged (tool_result inside user messages, tool_use inside assistant).
+
+    For OpenAI-compatible providers (Azure, OpenAI, …) two transformations
+    are applied:
+    * ToolResultBlocks inside a user message are emitted as individual
+      ``{"role": "tool", ...}`` messages — the only format Azure accepts.
+    * ToolCall blocks inside an assistant message are emitted in the
+      ``tool_calls`` array field instead of the content list.
+    """
+    if not _is_openai_compat(model):
+        return [_to_litellm_message(m, model) for m in messages]
+
+    result: list[dict] = []
+    for m in messages:
+        if m.role == "user":
+            tool_results = [b for b in m.content if isinstance(b, ToolResultBlock)]
+            other_blocks = [b for b in m.content if not isinstance(b, ToolResultBlock)]
+            # Each ToolResultBlock becomes its own tool-role message.
+            for tr in tool_results:
+                result.append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": tr.tool_use_id,
+                        "content": tr.content,
+                    }
+                )
+            # Remaining content (text, PDFs, …) stays in a user message.
+            if other_blocks:
+                blocks: list[dict] = []
+                for b in other_blocks:
+                    r = _to_litellm_block(b, model)
+                    if isinstance(r, list):
+                        blocks.extend(r)
+                    else:
+                        blocks.append(r)
+                result.append({"role": "user", "content": blocks})
+        elif m.role == "assistant":
+            tc_blocks = [b for b in m.content if isinstance(b, ToolCall)]
+            text_blocks = [b for b in m.content if isinstance(b, TextBlock)]
+            text_str: str | None = "".join(b.text for b in text_blocks) or None
+            msg: dict = {"role": "assistant", "content": text_str}
+            if tc_blocks:
+                msg["tool_calls"] = [
+                    {
+                        "id": tc.id,
+                        "type": "function",
+                        "function": {
+                            "name": tc.name,
+                            "arguments": json.dumps(tc.input),
+                        },
+                    }
+                    for tc in tc_blocks
+                ]
+            result.append(msg)
+        else:
+            result.append(_to_litellm_message(m, model))
+    return result
 
 
 def _to_litellm_tool(t: ToolSchema) -> dict:
@@ -216,6 +292,14 @@ def _from_litellm_response(resp) -> Completion:
     #         tool_calls.append(tc)
     #         raw_blocks.append(tc)
     text_parts = resp.choices[0].message.content or ""
+
+    def safe_parse_json(s: str) -> dict:
+        try:
+            return json.loads(s)
+        except Exception as e:
+            log.warning("Failed to parse tool_call arguments as JSON: %s", e)
+            return {}
+
     if settings.is_debug:
         print("--------------------------------------------------")
         print(f"{resp}")
@@ -228,10 +312,16 @@ def _from_litellm_response(resp) -> Completion:
         ToolCall(
             id=tool_call.id,
             name=tool_call.function.name,
-            input=json.loads(tool_call.function.arguments),  # ["values"]
+            input=safe_parse_json(tool_call.function.arguments),  # ["values"]
         )
         for tool_call in resp.choices[0].message.tool_calls or []
     ]
+    # Populate raw_assistant_blocks so multi-turn conversation history
+    # carries the assistant's text and tool_calls for the next request.
+    if isinstance(text_parts, str) and text_parts:
+        raw_blocks.append(TextBlock(text=text_parts))
+    for tc in tool_calls:
+        raw_blocks.append(tc)
     usage = resp.usage
     usage_obj = Usage(
         input_tokens=getattr(usage, "prompt_tokens", 0) or 0,
@@ -285,7 +375,7 @@ class LiteLLMSession(LLMSession):
     ) -> Completion:
         kwargs: dict[str, Any] = {
             "model": self.model,
-            "messages": [_to_litellm_message(m, self.model) for m in messages],
+            "messages": _to_litellm_messages(messages, self.model),
             "stream": False,
         }
         if self._system:
@@ -302,10 +392,41 @@ class LiteLLMSession(LLMSession):
             kwargs["tool_choice"] = _to_litellm_tool_choice(tool_choice)
         kwargs.update(self._extra_kwargs)
 
-        resp = await litellm.acompletion(**kwargs)
-        # print(kwargs, resp)
-        return _from_litellm_response(resp)
-        return _from_litellm_response(resp.choices[0].message)
+        _max_retries = 6
+        _base_delay = 5.0
+        _cap = 120.0
+        for _attempt in range(_max_retries + 1):
+            try:
+                resp = await litellm.acompletion(**kwargs)
+                return _from_litellm_response(resp)
+            except litellm.RateLimitError as exc:
+                if _attempt >= _max_retries:
+                    raise
+                # Honour Retry-After if the provider sends one.
+                retry_after: float | None = None
+                try:
+                    hdr = getattr(exc, "response", None) and exc.response.headers.get(
+                        "Retry-After"
+                    )
+                    if hdr:
+                        retry_after = float(hdr)
+                except Exception:
+                    pass
+                delay = min(
+                    retry_after or (_base_delay * (2**_attempt)),
+                    _cap,
+                )
+                # ±10 % jitter
+                delay *= 1 + random.uniform(-0.1, 0.1)
+                log.warning(
+                    "RateLimitError on attempt %d/%d for model %s — "
+                    "retrying in %.1fs",
+                    _attempt + 1,
+                    _max_retries,
+                    self.model,
+                    delay,
+                )
+                await asyncio.sleep(delay)
 
     async def close(self) -> None:
         # LiteLLM has no persistent session state to clean up.
