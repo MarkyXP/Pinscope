@@ -17,12 +17,10 @@ supports vision, or to plain text extraction if neither is available.
 
 from __future__ import annotations
 
-import asyncio
 import base64
 import importlib.util
 import json
 import logging
-import random
 import sys
 from pathlib import Path
 from typing import Any
@@ -30,6 +28,8 @@ from typing import Any
 import litellm
 import pymupdf
 from litellm.utils import supports_pdf_input, supports_vision
+
+from backend.services.retry import async_retry
 
 from backend.config import settings
 from backend.services.llm.base import LLMProvider, LLMSession
@@ -366,6 +366,7 @@ class LiteLLMSession(LLMSession):
         self._temperature = temperature
         self._extra_kwargs = extra_kwargs
 
+    @async_retry(exceptions=(litellm.RateLimitError,), jitter=0.0)
     async def complete(
         self,
         *,
@@ -392,41 +393,8 @@ class LiteLLMSession(LLMSession):
             kwargs["tool_choice"] = _to_litellm_tool_choice(tool_choice)
         kwargs.update(self._extra_kwargs)
 
-        _max_retries = 6
-        _base_delay = 5.0
-        _cap = 120.0
-        for _attempt in range(_max_retries + 1):
-            try:
-                resp = await litellm.acompletion(**kwargs)
-                return _from_litellm_response(resp)
-            except litellm.RateLimitError as exc:
-                if _attempt >= _max_retries:
-                    raise
-                # Honour Retry-After if the provider sends one.
-                retry_after: float | None = None
-                try:
-                    hdr = getattr(exc, "response", None) and exc.response.headers.get(
-                        "Retry-After"
-                    )
-                    if hdr:
-                        retry_after = float(hdr)
-                except Exception:
-                    pass
-                delay = min(
-                    retry_after or (_base_delay * (2**_attempt)),
-                    _cap,
-                )
-                # ±10 % jitter
-                delay *= 1 + random.uniform(-0.1, 0.1)
-                log.warning(
-                    "RateLimitError on attempt %d/%d for model %s — "
-                    "retrying in %.1fs",
-                    _attempt + 1,
-                    _max_retries,
-                    self.model,
-                    delay,
-                )
-                await asyncio.sleep(delay)
+        resp = await litellm.acompletion(**kwargs)
+        return _from_litellm_response(resp)
 
     async def close(self) -> None:
         # LiteLLM has no persistent session state to clean up.

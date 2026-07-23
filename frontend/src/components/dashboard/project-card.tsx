@@ -138,13 +138,15 @@ export function ProjectCard({
 
   if (opensModalOnClick) {
     return (
-      <button
-        type="button"
+      <div
+        role="button"
+        tabIndex={0}
         onClick={() => onRerun?.(project)}
-        className="text-left w-full"
+        onKeyDown={(e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); onRerun?.(project); } }}
+        className="text-left w-full cursor-pointer"
       >
         {card}
-      </button>
+      </div>
     );
   }
 
